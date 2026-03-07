@@ -1,0 +1,1201 @@
+#!/usr/bin/env python3
+"""
+slowroads.py  –  Infinite UK countryside drive · PyOpenGL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+pip install pygame PyOpenGL PyOpenGL_accelerate numpy
+python slowroads.py
+
+Controls
+  W/Up       accelerate        S/Down     brake/reverse
+  A/Left     steer left        D/Right    steer right
+  1  Sports Car   2  Coach   3  Truck   4  Motorbike
+  RMB drag   orbit camera     ESC  quit
+"""
+import sys, math, random
+import numpy as np
+import pygame
+from pygame.locals import *
+from OpenGL.GL  import *
+from OpenGL.GLU import *
+
+# ═══════════════════════════════════════════════════════
+#  PERLIN NOISE  (no external package)
+# ═══════════════════════════════════════════════════════
+def _bperm(seed=42):
+    rng=np.random.default_rng(seed); p=np.arange(256,dtype=np.int32)
+    rng.shuffle(p); return np.tile(p,2)
+_PM=_bperm(42)
+def _fa(t):    return t*t*t*(t*(t*6-15)+10)
+def _lp(a,b,t):return a+t*(b-a)
+def _g2(h,x,y):return (x+y,-x+y,x-y,-x-y)[h&3]
+def _p2(x,y):
+    xi=int(math.floor(x))&255; yi=int(math.floor(y))&255
+    xf=x-math.floor(x);        yf=y-math.floor(y)
+    u=_fa(xf); v=_fa(yf); P=_PM
+    return _lp(_lp(_g2(P[P[xi  ]+yi  ],xf  ,yf  ),_g2(P[P[xi+1]+yi  ],xf-1,yf  ),u),
+               _lp(_g2(P[P[xi  ]+yi+1],xf  ,yf-1),_g2(P[P[xi+1]+yi+1],xf-1,yf-1),u),v)
+def pn(x,y,oc=1,pe=0.5):
+    v=0.;a=1.;f=1.;ma=0.
+    for _ in range(oc): v+=_p2(x*f,y*f)*a; ma+=a; a*=pe; f*=2.
+    return v/ma
+
+# ═══════════════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════════════
+WIN_W,WIN_H   = 0,0          # set at startup from display info
+FOV           = 68.0
+NEAR,FAR      = 0.2,400.0
+ROAD_W        = 7.2         # UK A-road width (m)
+SEG_L         = 3.5         # metres per road knot
+DRAW_AH       = 70          # segments rendered ahead
+DRAW_BH       = 14          # segments rendered behind
+WATER_Y       = -1.4        # peat bog surface
+BRDG_CLR      = 2.4
+MAX_LAT       = 130.0       # max lateral offset before boundary kick-in
+
+SKY_TOP=(0.50,0.58,0.72)    # grey-blue zenith
+SKY_BOT=(0.68,0.72,0.80)    # misty horizon
+FOG_COL=[0.68,0.72,0.80,1.0]
+
+VCFG={
+    'car':       dict(cb=12,cu=4.5,wb=2.6,ms=55,mr=15,ac=18,br=28,dr=1.0, gd=0.06),
+    'coach':     dict(cb=24,cu=8.5,wb=7.5,ms=24,mr= 8,ac= 5,br=10,dr=0.55,gd=0.06),
+    'truck':     dict(cb=28,cu=9.0,wb=5.5,ms=26,mr= 8,ac= 5,br=11,dr=0.58,gd=0.06),
+    'motorbike': dict(cb= 9,cu=3.0,wb=1.5,ms=58,mr=18,ac=20,br=28,dr=1.10,gd=0.03),
+}
+VNAMES=['car','coach','truck','motorbike']
+
+# ═══════════════════════════════════════════════════════
+#  UK MOORLAND TERRAIN
+# ═══════════════════════════════════════════════════════
+def th(x,z):
+    """UK landscape: large lakes · gentle moor · broad rolling fell."""
+    mac=pn(x*0.0014,z*0.0014)           # biome map  (large patches)
+    hil=pn(x*0.006, z*0.006, oc=3, pe=0.48)  # broad hills (wavelength ~165m)
+    mic=pn(x*0.055, z*0.055)            # surface texture
+    if mac<-0.28:                        # lake / reservoir (clearly below water)
+        return -3.0 + mac*4.0           # very negative → always a bridge
+    if mac<0.08:                         # low flood plain / valley
+        t=(mac+0.28)/0.36
+        return hil*(2.0+t*3.0)+mic*0.4
+    if mac<0.40:                         # rolling moorland (most land)
+        t=(mac-0.08)/0.32
+        return hil*(5.0+t*8.0)+mic*0.8+mac*3.0   # ~0 to 12 m
+    if mac<0.65:                         # high fell / escarpment
+        t=(mac-0.40)/0.25
+        return hil*(13.0+t*7.0)+mic*1.5+mac*5.0  # ~5 to 22 m
+    t=min(1.0,(mac-0.65)/0.20)
+    return hil*(20.0+t*6.0)+mic*2.5+mac*7.0      # rocky tops ~15-30 m
+
+def _mac(x,z):
+    """Biome value only – cheap, used for bridge detection."""
+    return pn(x*0.0014,z*0.0014)
+
+def tcol(h):
+    """UK moorland colour: bog → grass → heather → bracken → fell rock."""
+    if h<WATER_Y+0.6:
+        return (0.40,0.34,0.24)
+    if h<1.5:
+        t=max(0.,min(1.,(h-WATER_Y-0.6)/2.1))
+        return (0.28+t*.04,0.36+t*.04,0.20+t*.02)
+    if h<5.0:
+        t=(h-1.5)/3.5
+        return (0.32+t*.12,0.38-t*.08,0.20-t*.04)
+    if h<10.0:
+        t=(h-5.0)/5.0
+        return (0.44+t*.08,0.30-t*.06,0.22-t*.04)
+    t=min(1.0,(h-10.0)/8.0)
+    return (0.52+t*.14,0.46+t*.08,0.38+t*.10)
+
+WCOL=(0.22,0.28,0.24)
+
+def th_s(x,z):
+    """Smooth terrain (no micro) – used for road routing."""
+    mac=pn(x*0.0014,z*0.0014); hil=pn(x*0.006,z*0.006,oc=2,pe=0.48)
+    if mac<-0.28: return -3.0+mac*4.0
+    if mac<0.08:  return hil*(2.0+(mac+0.28)/0.36*3.0)
+    if mac<0.40:  return hil*(5.0+(mac-0.08)/0.32*8.0)+mac*3.0
+    if mac<0.65:  return hil*(13.0+(mac-0.40)/0.25*7.0)+mac*5.0
+    return hil*(20.0+min(1.0,(mac-0.65)/0.20)*6.0)+mac*7.0
+
+# ── height cache ────────────────────────────────────────────────
+_THC:dict={}; _THCG=2.0
+def th_c(x,z):
+    k=(int(round(x/_THCG)),int(round(z/_THCG)))
+    v=_THC.get(k)
+    if v is None:
+        if len(_THC)>40_000: _THC.clear()
+        _THC[k]=v=th(k[0]*_THCG,k[1]*_THCG)
+    return v
+
+# ── terrain normal ───────────────────────────────────────────────
+_NE=3.5
+def terrain_normal(x,z):
+    hL=th_s(x-_NE,z); hR=th_s(x+_NE,z)
+    hB=th_s(x,z-_NE); hF=th_s(x,z+_NE)
+    tx=np.array([2.*_NE,hR-hL,0.]); tz=np.array([0.,hF-hB,2.*_NE])
+    n=np.cross(tz,tx); nl=np.linalg.norm(n)
+    return n/nl if nl>1e-6 else np.array([0.,1.,0.])
+
+# ═══════════════════════════════════════════════════════
+#  ROAD SPLINE  (infinite, lazily grown)
+# ═══════════════════════════════════════════════════════
+class Road:
+    def __init__(self):
+        self.pts=[]; self.tans=[]; self.nors=[]; self._br=[]
+        self._ang=0.; self._pos=np.zeros(3,dtype=np.float64)
+        self._grow(DRAW_BH+DRAW_AH+80)
+
+    def _grow(self,tgt):
+        while len(self.pts)<tgt:
+            i=len(self.pts)
+            self._ang+=pn(i*0.008,2.7)*0.055
+            dx=math.sin(self._ang)*SEG_L; dz=-math.cos(self._ang)*SEG_L
+            nxt=self._pos+np.array([dx,0.,dz])
+            # 9-point terrain average for smooth road height
+            offsets=[(ox,oz) for ox in(-10,0,10) for oz in(-10,0,10)]
+            h_avg=sum(th_s(float(nxt[0]+ox),float(nxt[2]+oz)) for ox,oz in offsets)/9.
+            if not hasattr(self,'_hb'): self._hb=h_avg
+            # LP smoother – road follows terrain gradually (max 0.18 m/seg = ~5% grade)
+            self._hb+=max(-0.18,min(0.18,(h_avg-self._hb)*0.06))
+            # bridge: use biome check, not height check (hills can go negative)
+            mac_here=_mac(float(nxt[0]),float(nxt[2]))
+            over_water=(mac_here<-0.28)
+            ty=(WATER_Y+BRDG_CLR) if over_water else max(WATER_Y+0.05, self._hb+0.12)
+            dy=max(-0.18,min(0.18,(ty-float(self._pos[1]))*0.08))
+            new=self._pos+np.array([dx,dy,dz])
+            if not over_water:
+                g2=th_s(float(new[0]),float(new[2]))
+                abs_floor=g2+0.05 if g2>WATER_Y else WATER_Y+BRDG_CLR
+                if new[1]<abs_floor:
+                    new[1]=min(abs_floor, float(new[1])+0.18)
+                    self._hb=max(self._hb, float(new[1]))
+            tan=new-self._pos; tan/=np.linalg.norm(tan)+1e-9
+            nor=np.array([tan[2],0.,-tan[0]]); nor/=np.linalg.norm(nor)+1e-9
+            self.pts.append(new.copy()); self.tans.append(tan.copy())
+            self.nors.append(nor.copy()); self._br.append(over_water)
+            self._pos=new
+
+    def get(self,i):
+        self._grow(i+40); return self.pts[i],self.tans[i],self.nors[i]
+    def bridge(self,i):
+        self._grow(i+40); return self._br[i] if i<len(self._br) else False
+
+# ═══════════════════════════════════════════════════════
+#  PLAYER  –  free world-space movement, terrain tilt, boundary
+# ═══════════════════════════════════════════════════════
+def _nearest_seg(pos,road,hint,win=60):
+    px,pz=float(pos[0]),float(pos[2])
+    road.get(hint+win+10)
+    bi,bd=hint,1e18
+    for i in range(max(0,hint-win//3),hint+win):
+        p=road.get(i)[0]
+        d=(float(p[0])-px)**2+(float(p[2])-pz)**2
+        if d<bd: bd=d; bi=i
+    return bi
+
+class Player:
+    def __init__(self,road,veh='car'):
+        p0,t0,_=road.get(5)
+        self.pos=p0.copy()
+        self.pos[1]=max(WATER_Y,th_s(*map(float,[p0[0],p0[2]])))+0.08
+        self.heading=math.atan2(float(t0[0]),-float(t0[2]))
+        self.speed=0.; self.steer=0.
+        self.veh=veh; self.near=5
+        self.surf_up=np.array([0.,1.,0.])
+        self.at_boundary=0.  # 0-1 how close to edge (for HUD flash)
+
+    def update(self,road,keys,dt):
+        c=VCFG[self.veh]
+        # speed
+        if keys[K_UP] or keys[K_w]:
+            self.speed=min(c['ms'],self.speed+c['ac']*dt)
+        elif keys[K_DOWN] or keys[K_s]:
+            self.speed=(max(0.,self.speed-c['br']*dt) if self.speed>0.3
+                        else max(-c['mr'],self.speed-c['ac']*0.55*dt))
+        else:
+            self.speed*=1.-min(1.,c['dr']*dt)
+            if abs(self.speed)<0.05: self.speed=0.
+        # steer
+        si=0.
+        if keys[K_LEFT]  or keys[K_a]: si=-1.
+        if keys[K_RIGHT] or keys[K_d]: si= 1.
+        self.steer+=(si-self.steer)*min(1.,6.*dt)
+        v_eff=math.copysign(min(abs(self.speed),9.),self.speed)
+        self.heading+=self.steer*math.radians(c['wb']*4.5)/c['wb']*v_eff*dt
+        # move
+        fv=np.array([math.sin(self.heading),0.,-math.cos(self.heading)])
+        self.pos=self.pos+fv*self.speed*dt
+        # ── height snap (matches visual terrain exactly) ──────────
+        px,pz=float(self.pos[0]),float(self.pos[2])
+        self.near=_nearest_seg(self.pos,road,self.near)
+        rp,_,rn=road.get(self.near)
+        xzd=math.hypot(px-float(rp[0]),pz-float(rp[2]))
+        on_road=xzd<ROAD_W*0.55
+        br=road.bridge(self.near)
+        if on_road:
+            ty=float(rp[1])+c['gd']
+        elif br:
+            # on bridge but off to side – sit at water level
+            ty=max(WATER_Y, th_c(px,pz))+c['gd']
+        else:
+            edge_d=max(0., xzd-ROAD_W*0.5)
+            gnd_raw=th_c(px,pz)
+            h=_blended_h(gnd_raw, float(rp[1]), edge_d, br)
+            ty=max(WATER_Y, h)+c['gd']
+        self.pos[1]+=(ty-self.pos[1])*min(1.,18.*dt)
+        # terrain tilt
+        tn=terrain_normal(px,pz)
+        self.surf_up+=(tn-self.surf_up)*min(1.,8.*dt)
+        sl=np.linalg.norm(self.surf_up)
+        if sl>1e-6: self.surf_up/=sl
+        # boundary enforcement
+        diff=self.pos-rp; lat=float(np.dot(diff,rn))
+        lat_abs=abs(lat)
+        self.at_boundary=max(0.,min(1.,(lat_abs-MAX_LAT*0.7)/(MAX_LAT*0.3)))
+        if lat_abs>MAX_LAT:
+            # hard clamp: instantly bring to boundary edge
+            self.pos-=rn*(lat-math.copysign(MAX_LAT,lat))
+
+    def fwd(self):
+        return np.array([math.sin(self.heading),0.,-math.cos(self.heading)])
+    def rgt(self):
+        return np.array([math.cos(self.heading),0., math.sin(self.heading)])
+    def sfwd(self):
+        f=self.fwd(); n=self.surf_up
+        fp=f-n*float(np.dot(f,n)); fl=np.linalg.norm(fp)
+        return fp/fl if fl>1e-6 else f
+    def srgt(self):
+        r=np.cross(self.sfwd(),self.surf_up); rl=np.linalg.norm(r)
+        return r/rl if rl>1e-6 else self.rgt()
+    def lean(self):
+        return -self.steer*min(1.,abs(self.speed)/5.)*22.
+
+# ═══════════════════════════════════════════════════════
+#  CAMERA
+# ═══════════════════════════════════════════════════════
+class Camera:
+    def __init__(self):
+        self._eye=np.zeros(3); self._at=np.zeros(3)
+        self.oyaw=0.; self.opitch=0.; self._cb=12.; self._cu=4.5
+    def setveh(self,v): self._cb=float(VCFG[v]['cb']); self._cu=float(VCFG[v]['cu'])
+    def update(self,pl,dt):
+        f=pl.fwd(); back=np.array([-f[0],0.,-f[2]]); bl=np.linalg.norm(back)
+        if bl>1e-6: back/=bl
+        we=pl.pos+back*self._cb+np.array([0.,self._cu,0.])
+        wa=pl.pos+f*5.; a=min(1.,7.*dt)
+        self._eye+=(we-self._eye)*a; self._at+=(wa-self._at)*a
+    def apply(self):
+        arm=self._eye-self._at
+        yr=math.radians(self.oyaw); cy,sy=math.cos(yr),math.sin(yr)
+        arm=np.array([cy*arm[0]+sy*arm[2],arm[1],-sy*arm[0]+cy*arm[2]])
+        rgt=np.cross(arm,[0.,1.,0.]); rl=np.linalg.norm(rgt)
+        if rl<1e-6: rgt=np.array([1.,0.,0.])
+        else: rgt/=rl
+        pr=math.radians(self.opitch); cp,sp=math.cos(pr),math.sin(pr)
+        arm=arm*cp+np.cross(rgt,arm)*sp+rgt*float(np.dot(rgt,arm))*(1.-cp)
+        eye=self._at+arm
+        glLoadIdentity()
+        gluLookAt(float(eye[0]),float(eye[1]),float(eye[2]),
+                  float(self._at[0]),float(self._at[1]),float(self._at[2]),0.,1.,0.)
+
+# ═══════════════════════════════════════════════════════
+#  SKY
+# ═══════════════════════════════════════════════════════
+def draw_sky():
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0,1,0,1,-1,1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glBegin(GL_QUADS)
+    glColor3f(*SKY_BOT); glVertex2f(0,0); glVertex2f(1,0)
+    glColor3f(*SKY_TOP); glVertex2f(1,1); glVertex2f(0,1)
+    glEnd()
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW); glPopMatrix()
+    glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glEnable(GL_FOG)
+
+# ═══════════════════════════════════════════════════════
+#  TERRAIN  –  flat near road, moors beyond
+# ═══════════════════════════════════════════════════════
+STRIPS=12; STRIP_W=11.0
+FLAT_R=26.0               # blend radius beyond road edge
+
+def _blended_h(h_raw, ry, edge_d, is_bridge):
+    """Blended terrain height at distance edge_d beyond road edge.
+    is_bridge → strip sits over water, show water surface."""
+    if is_bridge:
+        return WATER_Y
+    if edge_d < FLAT_R:
+        t=edge_d/FLAT_R; bt=t*t*(3-2*t)    # smoothstep
+        return ry*(1-bt)+h_raw*bt
+    return h_raw
+
+def draw_terrain(road,ci):
+    s=max(0,ci-DRAW_BH); e=ci+DRAW_AH; half=ROAD_W*.5
+    glNormal3f(0,1,0)
+    for side in(-1.,1.):
+        for k in range(STRIPS):
+            id_=half+k*STRIP_W; od_=id_+STRIP_W
+            glBegin(GL_QUAD_STRIP)
+            for i in range(s,e+1):
+                p,_,n=road.get(i); ry=float(p[1]); br=road.bridge(i)
+                for d in(id_,od_):
+                    pos=p+n*(side*d)
+                    px2,pz2=float(pos[0]),float(pos[2])
+                    h_raw=th_c(px2,pz2)
+                    h=_blended_h(h_raw, ry, d-half, br)
+                    h=max(WATER_Y,h)
+                    if h<=WATER_Y+0.05: glColor3f(*WCOL)
+                    else: glColor3f(*tcol(h))
+                    glVertex3f(px2,h,pz2)
+            glEnd()
+
+# ═══════════════════════════════════════════════════════
+#  ROAD MESH
+# ═══════════════════════════════════════════════════════
+def draw_road(road,ci):
+    s=max(0,ci-DRAW_BH); e=ci+DRAW_AH; half=ROAD_W*.5
+    glDisable(GL_LIGHTING)
+    # surface
+    glBegin(GL_QUAD_STRIP)
+    for i in range(s,e+1):
+        p,_,n=road.get(i)
+        glColor3f(*((0.50,0.47,0.42) if road.bridge(i) else (0.28,0.28,0.30)))
+        l=p-n*half; r=p+n*half
+        glVertex3f(float(l[0]),float(l[1]),float(l[2]))
+        glVertex3f(float(r[0]),float(r[1]),float(r[2]))
+    glEnd()
+    # white edge lines
+    glColor3f(0.85,0.85,0.85); glLineWidth(2.)
+    for sd in(-1.,1.):
+        glBegin(GL_LINE_STRIP)
+        for i in range(s,e+1):
+            p,_,n=road.get(i); ep=p+n*(sd*half)
+            glVertex3f(float(ep[0]),float(ep[1]),float(ep[2]))
+        glEnd()
+    # dashed centre line
+    glColor3f(0.92,0.88,0.60); glLineWidth(1.5)
+    for i in range(s,e):
+        if(i%5)<3:
+            p0=road.get(i)[0]; p1=road.get(i+1)[0]
+            glBegin(GL_LINES)
+            glVertex3f(float(p0[0]),float(p0[1]),float(p0[2]))
+            glVertex3f(float(p1[0]),float(p1[1]),float(p1[2]))
+            glEnd()
+    glLineWidth(1.); glEnable(GL_LIGHTING)
+
+# ═══════════════════════════════════════════════════════
+#  ROAD SKIRTS  –  close gap between road edge and terrain
+# ═══════════════════════════════════════════════════════
+def draw_road_skirts(road,ci):
+    s=max(0,ci-DRAW_BH); e=ci+DRAW_AH; half=ROAD_W*.5
+    glDisable(GL_LIGHTING)
+    for ss in(-1.,1.):
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s,e+1):
+            p,_,n=road.get(i)
+            ex=float((p+n*(ss*half))[0]); ez=float((p+n*(ss*half))[2])
+            ry=float(p[1])
+            gnd=th_c(ex,ez)
+            if gnd<WATER_Y: boty=WATER_Y; bc=(0.46,0.46,0.48)
+            else: boty=min(ry,gnd); bc=tcol(gnd)
+            rc=(0.50,0.47,0.42) if road.bridge(i) else (0.28,0.28,0.30)
+            glColor3f(*rc); glVertex3f(ex,ry,ez)
+            glColor3f(*bc); glVertex3f(ex,boty,ez)
+        glEnd()
+    glEnable(GL_LIGHTING)
+
+# ═══════════════════════════════════════════════════════
+#  BRIDGE PILLARS + GUARD RAILS
+# ═══════════════════════════════════════════════════════
+def _pbox(cx,cy_b,cz,w,h):
+    hw=w*.5; hc=cy_b+h*.5; hh=h*.5
+    fs=(( 0,0,1,(-hw,-hh,hw),(hw,-hh,hw),(hw,hh,hw),(-hw,hh,hw)),
+        ( 0,0,-1,(hw,-hh,-hw),(-hw,-hh,-hw),(-hw,hh,-hw),(hw,hh,-hw)),
+        ( 1,0,0,(hw,-hh,-hw),(hw,-hh,hw),(hw,hh,hw),(hw,hh,-hw)),
+        (-1,0,0,(-hw,-hh,hw),(-hw,-hh,-hw),(-hw,hh,-hw),(-hw,hh,hw)),
+        ( 0,1,0,(-hw,hh,hw),(hw,hh,hw),(hw,hh,-hw),(-hw,hh,-hw)),
+        ( 0,-1,0,(-hw,-hh,-hw),(hw,-hh,-hw),(hw,-hh,hw),(-hw,-hh,hw)))
+    glBegin(GL_QUADS)
+    for nx,ny,nz,v0,v1,v2,v3 in fs:
+        glNormal3f(nx,ny,nz)
+        for vx,vy,vz in(v0,v1,v2,v3): glVertex3f(cx+vx,hc+vy,cz+vz)
+    glEnd()
+
+def draw_bridge_pillars(road,ci):
+    s=max(0,ci-DRAW_BH); e=ci+DRAW_AH; half=ROAD_W*.5
+    glEnable(GL_LIGHTING); glColor3f(0.54,0.54,0.56)
+    for i in range(s,e,5):
+        if not road.bridge(i): continue
+        p,_,_=road.get(i); g=th_c(float(p[0]),float(p[2]))
+        bot=min(g,WATER_Y-1.); h=max(0.2,float(p[1])-bot)
+        _pbox(float(p[0]),bot,float(p[2]),1.1,h)
+    glDisable(GL_LIGHTING); glColor3f(0.60,0.61,0.63)
+    for ss in(-1.,1.):
+        run=[]
+        def fl(r):
+            if len(r)<2: return
+            glBegin(GL_QUAD_STRIP)
+            for rx,ry,rz in r: glVertex3f(rx,ry+0.88,rz); glVertex3f(rx,ry+1.14,rz)
+            glEnd()
+        for i in range(s,e+1):
+            if not road.bridge(i): fl(run); run=[]; continue
+            p,_,n=road.get(i); ep=p+n*(ss*(half+0.3))
+            run.append((float(ep[0]),float(p[1]),float(ep[2])))
+        fl(run)
+    glEnable(GL_LIGHTING)
+
+# ═══════════════════════════════════════════════════════
+#  TREES  –  UK deciduous + conifer mix, world-space grid
+# ═══════════════════════════════════════════════════════
+TCELL=22.; TREE_R=110.
+
+def _thash(ci,cj): return int((ci*73856093)^(cj*19349663))&0x7FFFFFFF
+
+def _cyl(x,y,z,r,h,s=7):
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s+1):
+        a=2*math.pi*j/s; ca=math.cos(a); sa=math.sin(a)
+        glNormal3f(ca,0,sa); glVertex3f(x+r*ca,y,z+r*sa); glVertex3f(x+r*ca,y+h,z+r*sa)
+    glEnd()
+
+def _cone(x,y,z,r,h,s=9):
+    inv=1./math.sqrt(h*h+r*r); un=h*inv
+    glBegin(GL_TRIANGLE_FAN); glNormal3f(0,1,0); glVertex3f(x,y+h,z)
+    for j in range(s+1):
+        a=2*math.pi*j/s; ca=math.cos(a); sa=math.sin(a)
+        glNormal3f(ca*un,r*inv,sa*un); glVertex3f(x+r*ca,y,z+r*sa)
+    glEnd()
+
+def _dome(x,y,z,r,h):
+    """Rounded deciduous crown (two stacked fans)."""
+    s=10
+    glBegin(GL_TRIANGLE_FAN); glNormal3f(0,1,0); glVertex3f(x,y+h,z)
+    for j in range(s+1):
+        a=2*math.pi*j/s
+        glNormal3f(math.cos(a),0.4,math.sin(a))
+        glVertex3f(x+r*.85*math.cos(a),y+h*.3,z+r*.85*math.sin(a))
+    glEnd()
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s+1):
+        a=2*math.pi*j/s; ca=math.cos(a); sa=math.sin(a)
+        glNormal3f(ca,0,sa)
+        glVertex3f(x+r*.85*ca,y+h*.3,z+r*.85*sa)
+        glVertex3f(x+r*ca,y,z+r*sa)
+    glEnd()
+
+TREE_ROAD_MARGIN = ROAD_W * 3.5   # clear corridor = half-road + ~22m either side
+
+def draw_trees(player_pos, road, near_seg):
+    px,pz=float(player_pos[0]),float(player_pos[2])
+    R2=TREE_R*TREE_R
+    i0=int(math.floor((px-TREE_R)/TCELL)); i1=int(math.floor((px+TREE_R)/TCELL))+1
+    j0=int(math.floor((pz-TREE_R)/TCELL)); j1=int(math.floor((pz+TREE_R)/TCELL))+1
+
+    # collect road centreline points spanning the full draw radius
+    lo=max(0, near_seg-45); hi=near_seg+45
+    road.get(hi+5)
+    road_pts=[(float(road.get(i)[0][0]), float(road.get(i)[0][2]))
+              for i in range(lo, hi)]
+    M2=TREE_ROAD_MARGIN**2
+
+    for ci in range(i0,i1):
+        for cj in range(j0,j1):
+            rng=random.Random(_thash(ci,cj))
+            if rng.random()>0.55: continue
+            tx=ci*TCELL+rng.uniform(1.,TCELL-1.)
+            tz=cj*TCELL+rng.uniform(1.,TCELL-1.)
+            if(tx-px)**2+(tz-pz)**2>R2: continue
+            # skip if inside road corridor
+            if any((tx-rpx)**2+(tz-rpz)**2<M2 for rpx,rpz in road_pts): continue
+            gnd=th_c(tx,tz)
+            if gnd<WATER_Y+0.2: continue          # no trees in water or on shore
+            tkh=rng.uniform(1.4,2.6); crr=rng.uniform(1.2,2.0); crh=rng.uniform(2.5,4.2)
+            conifer=(rng.random()<0.38)
+            glColor3f(0.36+rng.random()*.08,0.22+rng.random()*.06,0.10+rng.random()*.04)
+            _cyl(tx,gnd,tz,0.20,tkh)
+            if conifer:
+                glColor3f(0.10+rng.random()*.06,0.28+rng.random()*.10,0.10+rng.random()*.04)
+                _cone(tx,gnd+tkh,tz,crr*.70,crh*1.30)
+            else:
+                glColor3f(0.20+rng.random()*.10,0.30+rng.random()*.10,0.10+rng.random()*.06)
+                _dome(tx,gnd+tkh,tz,crr,crh*.80)
+
+# ═══════════════════════════════════════════════════════
+#  VEHICLE PRIMITIVES
+# ═══════════════════════════════════════════════════════
+def _box(cx,cy,cz,w,h,d):
+    hw,hh,hd=w*.5,h*.5,d*.5
+    fs=(( 0,0,1,(-hw,-hh,hd),(hw,-hh,hd),(hw,hh,hd),(-hw,hh,hd)),
+        ( 0,0,-1,(hw,-hh,-hd),(-hw,-hh,-hd),(-hw,hh,-hd),(hw,hh,-hd)),
+        ( 1,0,0,(hw,-hh,-hd),(hw,-hh,hd),(hw,hh,hd),(hw,hh,-hd)),
+        (-1,0,0,(-hw,-hh,hd),(-hw,-hh,-hd),(-hw,hh,-hd),(-hw,hh,hd)),
+        ( 0,1,0,(-hw,hh,hd),(hw,hh,hd),(hw,hh,-hd),(-hw,hh,-hd)),
+        ( 0,-1,0,(-hw,-hh,-hd),(hw,-hh,-hd),(hw,-hh,hd),(-hw,-hh,hd)))
+    glBegin(GL_QUADS)
+    for nx,ny,nz,v0,v1,v2,v3 in fs:
+        glNormal3f(nx,ny,nz)
+        for vx,vy,vz in(v0,v1,v2,v3): glVertex3f(cx+vx,cy+vy,cz+vz)
+    glEnd()
+
+def _whl(cx,cy,cz,r,w,s=14):
+    hw=w*.5; TP=2*math.pi
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s+1):
+        a=TP*j/s; ca=math.cos(a); sa=math.sin(a)
+        glNormal3f(0,ca,sa)
+        glVertex3f(cx-hw,cy+r*ca,cz+r*sa); glVertex3f(cx+hw,cy+r*ca,cz+r*sa)
+    glEnd()
+    for sx,wd in((-1,1),(1,-1)):
+        glBegin(GL_TRIANGLE_FAN); glNormal3f(float(sx),0,0); glVertex3f(cx+sx*hw,cy,cz)
+        for j in range(s+1):
+            a=wd*TP*j/s; glVertex3f(cx+sx*hw,cy+r*math.cos(a),cz+r*math.sin(a))
+        glEnd()
+
+def _vm(pp,fw,rg):
+    """Push vehicle matrix. Local +Z=forward +X=right +Y=up."""
+    up=np.cross(fw,rg)  # fw × rg = up  (verified: cross((0,0,1),(1,0,0))=(0,1,0))
+    ul=np.linalg.norm(up)
+    if ul>1e-6: up/=ul
+    m=(float(rg[0]),float(rg[1]),float(rg[2]),0,
+       float(up[0]),float(up[1]),float(up[2]),0,
+       float(fw[0]),float(fw[1]),float(fw[2]),0,
+       float(pp[0]),float(pp[1]),float(pp[2]),1)
+    glPushMatrix(); glMultMatrixf(m)
+
+# ═══════════════════════════════════════════════════════
+#  SPORTS CAR  (low-slung, wide, Porsche/Lotus inspired)
+# ═══════════════════════════════════════════════════════
+def draw_car(pp,fw,rg,_=0.):
+    _vm(pp,fw,rg)
+    # ── underbody sill ────────────────────────────────
+    glColor3f(0.18,0.18,0.20); _box(0,0.14,0.0,2.04,0.18,4.20)
+    # ── front splitter ────────────────────────────────
+    glColor3f(0.14,0.14,0.16); _box(0,0.10,2.10,1.88,0.08,0.28)
+    # ── main body hull (very low) ─────────────────────
+    glColor3f(0.04,0.52,0.90)  # vivid blue
+    _box(0,0.36,0.0,2.06,0.38,4.20)    # lower body
+    _box(0,0.60,0.18,1.94,0.26,3.50)   # upper body beltline
+    # ── long sculpted hood ────────────────────────────
+    glColor3f(0.04,0.48,0.84)
+    _box(0,0.62,1.55,1.88,0.12,1.45)   # hood top (slight wedge implied)
+    # ── greenhouse / cabin ────────────────────────────
+    glColor3f(0.03,0.44,0.78)
+    _box(0,0.88,-0.10,1.50,0.44,1.90)  # roof
+    # ── raked windscreen ──────────────────────────────
+    glColor3f(0.14,0.22,0.36)
+    _box(0,0.82,0.96,1.38,0.40,0.10)
+    # ── rear glass / fastback ─────────────────────────
+    glColor3f(0.14,0.22,0.36)
+    _box(0,0.76,-1.05,1.36,0.34,0.10)
+    # ── side windows ─────────────────────────────────
+    glColor3f(0.14,0.22,0.36)
+    _box( 0.78,0.90,-0.10,0.06,0.36,1.50)
+    _box(-0.78,0.90,-0.10,0.06,0.36,1.50)
+    # ── rear haunches (wide hips) ─────────────────────
+    glColor3f(0.04,0.50,0.86)
+    _box( 0.96,0.36,-0.80,0.22,0.44,1.60)
+    _box(-0.96,0.36,-0.80,0.22,0.44,1.60)
+    # ── front wheel arch lips ─────────────────────────
+    _box( 0.88,0.36,1.50,0.18,0.30,1.10)
+    _box(-0.88,0.36,1.50,0.18,0.30,1.10)
+    # ── rear diffuser ────────────────────────────────
+    glColor3f(0.14,0.14,0.16)
+    _box(0,0.14,-2.06,1.80,0.10,0.26)
+    # ── rear spoiler ──────────────────────────────────
+    glColor3f(0.02,0.38,0.70)
+    _box(0,1.16,-1.40,1.60,0.08,0.22)  # spoiler blade
+    _box( 0.60,1.02,-1.40,0.08,0.20,0.22)  # endplate L
+    _box(-0.60,1.02,-1.40,0.08,0.20,0.22)  # endplate R
+    # ── headlights (narrow LED strips) ────────────────
+    glColor3f(0.92,0.95,0.98)
+    _box( 0.62,0.52,2.14,0.52,0.06,0.08)
+    _box(-0.62,0.52,2.14,0.52,0.06,0.08)
+    # ── DRL strips ───────────────────────────────────
+    glColor3f(0.98,0.98,0.94)
+    _box( 0.52,0.60,2.14,0.60,0.04,0.06)
+    _box(-0.52,0.60,2.14,0.60,0.04,0.06)
+    # ── tail lights (wide strip) ──────────────────────
+    glColor3f(0.88,0.06,0.06)
+    _box(0,0.48,-2.14,1.80,0.10,0.08)
+    # ── front bumper / chin ───────────────────────────
+    glColor3f(0.06,0.42,0.76)
+    _box(0,0.28,2.14,1.86,0.24,0.14)
+    # ── wheels ────────────────────────────────────────
+    WR,WW,WY=0.34,0.22,0.34
+    glColor3f(0.11,0.11,0.12)
+    for wz in(1.42,-1.32):
+        for wx in(1.02,-1.02): _whl(wx,WY,wz,WR,WW)
+    glColor3f(0.72,0.72,0.76)       # alloy rims
+    for wz in(1.42,-1.32):
+        for wx in(1.02,-1.02): _whl(wx,WY,wz,WR*.56,WW+.02,8)
+    # brake caliper flash (red)
+    glColor3f(0.80,0.06,0.06)
+    for wz in(1.42,-1.32):
+        for wx in(1.02,-1.02): _box(wx,WY,wz,0.04,0.12,0.12)
+    glPopMatrix()
+
+# ═══════════════════════════════════════════════════════
+#  COACH  (long-distance luxury, white/silver + blue stripe)
+# ═══════════════════════════════════════════════════════
+def draw_coach(pp,fw,rg,_=0.):
+    _vm(pp,fw,rg)
+    glColor3f(0.92,0.92,0.94); _box(0,1.70,0,2.50,3.10,11.20)  # body
+    glColor3f(0.72,0.72,0.74); _box(0,0.44,0,2.54,0.72,11.30)  # skirt
+    glColor3f(0.14,0.34,0.72); _box(0,1.62,0,2.52,0.34,11.22)  # stripe
+    glColor3f(0.82,0.82,0.84); _box(0,3.30,0,2.46,0.28,11.00)  # roof
+    glColor3f(0.18,0.28,0.46)
+    for wz in(4.6,3.1,1.6,0.1,-1.4,-2.9,-4.0,-5.1):
+        _box(1.26,2.18,wz,.06,.96,1.08); _box(-1.26,2.18,wz,.06,.96,1.08)
+    glColor3f(0.80,0.80,0.82)
+    for wz in(3.4,1.0,-1.4,-3.8):
+        _box(1.27,0.52,wz,.06,.52,1.60); _box(-1.27,0.52,wz,.06,.52,1.60)
+    glColor3f(0.16,0.26,0.44)
+    _box(0,2.10,5.60,2.20,1.60,.10); _box(0,3.00,5.40,2.10,.48,.22)
+    _box(0,2.10,-5.60,2.20,1.40,.10)
+    glColor3f(0.14,0.34,0.72); _box(0,1.00,5.62,2.40,.96,.14)
+    glColor3f(0.88,0.76,0.06); _box(0,3.18,5.48,1.80,.38,.10)
+    glColor3f(0.96,0.94,0.62)
+    _box(.88,.82,5.68,.54,.24,.10); _box(-.88,.82,5.68,.54,.24,.10)
+    glColor3f(0.88,0.08,0.08)
+    _box(.90,.86,-5.68,.56,.28,.10); _box(-.90,.86,-5.68,.56,.28,.10)
+    glColor3f(0.30,0.30,0.32)
+    _box(0,.18,5.70,2.30,.28,.20); _box(0,.18,-5.70,2.30,.28,.20)
+    glColor3f(0.10,0.22,0.58); _box(-1.28,1.60,4.20,.06,2.40,1.40)
+    glColor3f(0.30,0.30,0.32)
+    _box(1.42,2.60,4.90,.16,.22,.36); _box(-1.42,2.60,4.90,.16,.22,.36)
+    WR,WW,WY=0.52,.30,.52
+    glColor3f(0.12,0.12,0.13)
+    for wz,wx in((4.50,1.28),(4.50,-1.28),(0.20,1.28),(0.20,-1.28),(-1.10,1.28),(-1.10,-1.28)):
+        _whl(wx,WY,wz,WR,WW)
+    glColor3f(0.60,0.60,0.63)
+    for wz,wx in((4.50,1.28),(4.50,-1.28),(0.20,1.28),(0.20,-1.28),(-1.10,1.28),(-1.10,-1.28)):
+        _whl(wx,WY,wz,WR*.54,WW+.02,8)
+    glPopMatrix()
+
+# ═══════════════════════════════════════════════════════
+#  EUROPEAN CAB-OVER CARGO TRUCK  (flat-front, like Volvo FH / Actros)
+# ═══════════════════════════════════════════════════════
+def draw_truck(pp,fw,rg,_=0.):
+    _vm(pp,fw,rg)
+    # ── flat-front cab ────────────────────────────────────────
+    glColor3f(0.20,0.38,0.65)                   # dark blue cab
+    _box(0,1.82,2.90,2.44,3.20,3.80)           # cab main block
+    # ── cab roof bar / air deflector ──────────────────────────
+    glColor3f(0.16,0.30,0.54)
+    _box(0,3.54,2.90,2.30,0.34,3.50)           # roof
+    _box(0,3.90,2.10,2.20,0.22,1.40)           # aero deflector slope
+    # ── FLAT FRONT FACE (key feature) ─────────────────────────
+    glColor3f(0.18,0.34,0.60)
+    _box(0,2.00,4.82,2.44,3.40,0.14)           # full-height front panel
+    # ── large panoramic windscreen ────────────────────────────
+    glColor3f(0.16,0.24,0.40)
+    _box(0,2.64,4.80,2.10,1.86,0.10)           # main windscreen
+    # ── windscreen upper black trim ───────────────────────────
+    glColor3f(0.12,0.12,0.14)
+    _box(0,3.60,4.82,2.20,0.28,0.12)
+    # ── lower grille band ─────────────────────────────────────
+    glColor3f(0.14,0.14,0.16)
+    _box(0,1.14,4.84,2.30,0.80,0.16)
+    # ── bumper / bull bar ─────────────────────────────────────
+    glColor3f(0.22,0.22,0.24)
+    _box(0,0.46,4.86,2.30,0.52,0.22)
+    # ── headlights (horizontal LED bars) ─────────────────────
+    glColor3f(0.92,0.94,0.98)
+    _box( 0.88,2.42,4.84,0.54,0.14,0.10)
+    _box(-0.88,2.42,4.84,0.54,0.14,0.10)
+    # ── DRL strips ───────────────────────────────────────────
+    glColor3f(0.98,0.96,0.84)
+    _box( 0.68,2.60,4.84,0.80,0.06,0.08)
+    _box(-0.68,2.60,4.84,0.80,0.06,0.08)
+    # ── indicators ────────────────────────────────────────────
+    glColor3f(0.92,0.58,0.06)
+    _box( 1.06,1.80,4.84,0.26,0.20,0.10)
+    _box(-1.06,1.80,4.84,0.26,0.20,0.10)
+    # ── side windows ──────────────────────────────────────────
+    glColor3f(0.14,0.22,0.38)
+    _box( 1.23,2.60,2.90,0.06,1.60,2.60)
+    _box(-1.23,2.60,2.90,0.06,1.60,2.60)
+    # ── door lines ────────────────────────────────────────────
+    glColor3f(0.14,0.28,0.52)
+    _box( 1.24,1.60,2.90,0.06,2.80,3.60)
+    _box(-1.24,1.60,2.90,0.06,2.80,3.60)
+    # ── steps / entry ─────────────────────────────────────────
+    glColor3f(0.12,0.12,0.14)
+    _box(-1.30,0.52,3.40,0.12,0.40,0.70)
+    # ── mirrors (large, wing-type) ────────────────────────────
+    glColor3f(0.14,0.14,0.16)
+    _box( 1.48,2.90,4.20,0.18,0.28,0.50)
+    _box(-1.48,2.90,4.20,0.18,0.28,0.50)
+    # ── sleeper cab bump ──────────────────────────────────────
+    glColor3f(0.17,0.33,0.58)
+    _box(0,2.80,1.08,2.30,0.90,1.40)           # sleeper extension
+    # ── chrome exhaust stacks ─────────────────────────────────
+    glColor3f(0.72,0.72,0.75)
+    _cyl( 1.16,1.60,2.20,0.09,2.80,8)
+    _cyl(-1.16,1.60,2.20,0.09,2.80,8)
+    # ── chassis rails ─────────────────────────────────────────
+    glColor3f(0.24,0.24,0.26)
+    _box( 0.68,0.56,-3.60,0.22,0.26,10.60)
+    _box(-0.68,0.56,-3.60,0.22,0.26,10.60)
+    for cz in(1.20,-0.60,-2.40,-4.20,-6.00,-7.80):
+        _box(0,0.56,cz,1.50,0.16,0.24)
+    # ── CARGO BOX ─────────────────────────────────────────────
+    glColor3f(0.88,0.88,0.90)                   # white/silver box
+    _box(0,2.02,-4.20,2.42,3.50,9.20)
+    glColor3f(0.70,0.70,0.72)
+    _box(0,3.80,-4.20,2.46,0.18,9.10)          # roof
+    _box(0,0.62,-4.20,2.46,0.82,9.30)          # underbelly
+    # ── cargo box ribbing (structural ridges) ─────────────────
+    glColor3f(0.78,0.78,0.80)
+    for rz in(0.0,-1.8,-3.6,-5.4,-7.2,-8.6):
+        _box( 1.22,2.00,rz,0.06,3.20,0.12)
+        _box(-1.22,2.00,rz,0.06,3.20,0.12)
+    # ── rear cargo doors ──────────────────────────────────────
+    glColor3f(0.82,0.82,0.84)
+    _box( 0.62,2.10,-8.82,0.56,3.00,0.10)
+    _box(-0.62,2.10,-8.82,0.56,3.00,0.10)
+    # ── tail lights ───────────────────────────────────────────
+    glColor3f(0.88,0.06,0.06)
+    _box( 1.08,0.98,-8.82,0.40,0.34,0.10)
+    _box(-1.08,0.98,-8.82,0.40,0.34,0.10)
+    glColor3f(0.92,0.46,0.04)       # indicators
+    _box( 1.08,0.60,-8.82,0.32,0.22,0.10)
+    _box(-1.08,0.60,-8.82,0.32,0.22,0.10)
+    # ── company logo band ─────────────────────────────────────
+    glColor3f(0.20,0.38,0.65)
+    _box(0,3.38,-4.20,2.44,0.60,9.10)
+    # ── wheels ────────────────────────────────────────────────
+    WR,WW,WY=0.54,.32,.54
+    glColor3f(0.11,0.11,0.12)
+    for wx in(1.28,-1.28): _whl(wx,WY,4.20,WR,WW)   # front steer
+    for wz in(-1.80,-3.00):                            # rear drive tandem
+        for wx in(1.32,-1.32): _whl(wx,WY,wz,WR,WW)
+    for wx in(1.28,-1.28): _whl(wx,WY,-7.20,WR,WW)   # tag axle
+    glColor3f(0.60,0.60,0.63)
+    for wx in(1.28,-1.28): _whl(wx,WY,4.20,WR*.54,WW+.02,8)
+    for wz in(-1.80,-3.00):
+        for wx in(1.32,-1.32): _whl(wx,WY,wz,WR*.54,WW+.02,8)
+    for wx in(1.28,-1.28): _whl(wx,WY,-7.20,WR*.54,WW+.02,8)
+    glPopMatrix()
+
+def _cyl(x,y,z,r,h,s=7):
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s+1):
+        a=2*math.pi*j/s; ca=math.cos(a); sa=math.sin(a)
+        glNormal3f(ca,0,sa); glVertex3f(x+r*ca,y,z+r*sa); glVertex3f(x+r*ca,y+h,z+r*sa)
+    glEnd()
+
+# ═══════════════════════════════════════════════════════
+#  MOTORBIKE
+# ═══════════════════════════════════════════════════════
+def draw_motorbike(pp,fw,rg,lean=0.):
+    lr=math.radians(lean); world_up=np.array([0.,1.,0.])
+    cl,sl=math.cos(lr),math.sin(lr)
+    up_v=world_up*cl-rg*sl; ul=np.linalg.norm(up_v)
+    if ul>1e-6: up_v/=ul
+    rg2=np.cross(fw,up_v); rl=np.linalg.norm(rg2)
+    if rl>1e-6: rg2/=rl
+    up=np.cross(rg2,fw); ul=np.linalg.norm(up)
+    if ul>1e-6: up/=ul
+    m=(float(rg2[0]),float(rg2[1]),float(rg2[2]),0,
+       float(up[0]), float(up[1]), float(up[2]), 0,
+       float(fw[0]), float(fw[1]), float(fw[2]), 0,
+       float(pp[0]), float(pp[1]), float(pp[2]), 1)
+    glPushMatrix(); glMultMatrixf(m)
+    WR,WW=0.32,.14
+    glColor3f(0.14,0.14,0.16); _box(0,.72,0,.12,.24,1.55)
+    glColor3f(0.20,0.20,0.22); _box(0,.48,.10,.34,.36,.90)
+    glColor3f(0.72,0.06,0.10); _box(0,.95,.22,.26,.28,.72)
+    glColor3f(0.10,0.10,0.12); _box(0,.92,-.42,.22,.16,.68)
+    glColor3f(0.60,0.05,0.08); _box(0,.84,-.90,.18,.22,.36)
+    glColor3f(0.18,0.18,0.20); _box(0,.90,1.04,.30,.28,.26)
+    glColor3f(0.96,0.94,0.56); _box(0,.90,1.18,.22,.20,.06)
+    glColor3f(0.90,0.06,0.06); _box(0,.84,-1.10,.18,.14,.06)
+    glColor3f(0.45,0.45,0.48); _box(0,1.08,.82,.86,.07,.08)
+    for sx in(.13,-.13): glColor3f(0.55,0.55,0.58); _box(sx,.56,.88,.06,.80,.08)
+    glColor3f(0.18,0.18,0.20); _box(0,.42,-.52,.08,.10,.70)
+    glColor3f(0.52,0.50,0.44); _box(.18,.36,.30,.06,.08,1.10)
+    glColor3f(0.11,0.11,0.12)
+    _whl(0,WR,.86,WR,WW); _whl(0,WR,-.82,WR,WW)
+    glColor3f(0.55,0.55,0.58)
+    _whl(0,WR,.86,WR*.58,WW+.02,8); _whl(0,WR,-.82,WR*.58,WW+.02,8)
+    glPopMatrix()
+
+# ═══════════════════════════════════════════════════════
+#  VEHICLE DISPATCHER
+# ═══════════════════════════════════════════════════════
+def draw_vehicle(player):
+    f=player.sfwd(); r=player.srgt(); p=player.pos; v=player.veh
+    if   v=='car':       draw_car(p,f,r)
+    elif v=='coach':     draw_coach(p,f,r)
+    elif v=='truck':     draw_truck(p,f,r)
+    elif v=='motorbike': draw_motorbike(p,f,r,player.lean())
+
+# ═══════════════════════════════════════════════════════
+#  SPEEDOMETER HUD
+# ═══════════════════════════════════════════════════════
+_SPD_MAX={'car':220,'coach':140,'truck':130,'motorbike':240}
+_SPD_COLS=[(0,80,'#1db84a'),(80,130,'#e6c014'),(130,300,'#e03030')]
+
+def _hex(s): r=int(s[1:3],16)/255; g=int(s[3:5],16)/255; b=int(s[5:7],16)/255; return r,g,b
+
+def _ring_arc(cx,cy,r,a0,a1,thick,segs=48):
+    """Thick arc via QUAD_STRIP. a0/a1 in radians."""
+    glBegin(GL_QUAD_STRIP)
+    for i in range(segs+1):
+        a=a0+(a1-a0)*i/segs; ca,sa=math.cos(a),math.sin(a)
+        glVertex2f(cx+(r-thick)*ca, cy+(r-thick)*sa)
+        glVertex2f(cx+r*ca,          cy+r*sa)
+    glEnd()
+
+def _filled_circle(cx,cy,r,segs=32):
+    glBegin(GL_TRIANGLE_FAN); glVertex2f(cx,cy)
+    for i in range(segs+1):
+        a=2*math.pi*i/segs; glVertex2f(cx+r*math.cos(a),cy+r*math.sin(a))
+    glEnd()
+
+# 7-segment layout  (segments a-g, True=on)
+# a=top  b=top-right  c=bot-right  d=bottom  e=bot-left  f=top-left  g=middle
+_SEG7={
+    '0':(1,1,1,1,1,1,0),'1':(0,1,1,0,0,0,0),'2':(1,1,0,1,1,0,1),
+    '3':(1,1,1,1,0,0,1),'4':(0,1,1,0,0,1,1),'5':(1,0,1,1,0,1,1),
+    '6':(1,0,1,1,1,1,1),'7':(1,1,1,0,0,0,0),'8':(1,1,1,1,1,1,1),
+    '9':(1,1,1,1,0,1,1),
+}
+
+def _draw_digit(cx,cy,cw,ch,segs_on):
+    """Draw a 7-segment digit centred at cx,cy. cw/ch = width/height."""
+    hw=cw/2.; hh=ch/2.; t=max(4.0, cw*0.22)   # stroke ≥ 4px
+    def hrz(y):
+        glBegin(GL_QUADS)
+        glVertex2f(cx-hw+t, cy+y-t/2.); glVertex2f(cx+hw-t, cy+y-t/2.)
+        glVertex2f(cx+hw-t, cy+y+t/2.); glVertex2f(cx-hw+t, cy+y+t/2.)
+        glEnd()
+    def vrt(x,y0,y1):
+        glBegin(GL_QUADS)
+        glVertex2f(cx+x-t/2., cy+y0+t); glVertex2f(cx+x+t/2., cy+y0+t)
+        glVertex2f(cx+x+t/2., cy+y1-t); glVertex2f(cx+x-t/2., cy+y1-t)
+        glEnd()
+    a,b,c,d,e,f,g = segs_on
+    if a: hrz( hh)
+    if d: hrz(-hh)
+    if g: hrz(  0)
+    if b: vrt( hw,  0,  hh)
+    if c: vrt( hw, -hh,  0)
+    if f: vrt(-hw,  0,  hh)
+    if e: vrt(-hw, -hh,  0)
+
+def draw_speedometer(player):
+    spd_kmh = abs(player.speed) * 3.6
+    max_s   = float(_SPD_MAX.get(player.veh, 220))
+    frac    = min(1.0, spd_kmh / max_s)
+
+    cx = WIN_W - 118.;  cy = 118.   # gauge centre, bottom-right
+    R  = 78.;           thick = 13.
+
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, WIN_W, 0, WIN_H, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+
+    # ── outer bezel ─────────────────────────────────────────────
+    glColor4f(0.24, 0.26, 0.30, 1.0)
+    _filled_circle(cx, cy, R + thick + 8)
+
+    # ── dark disc ───────────────────────────────────────────────
+    glColor4f(0.06, 0.06, 0.10, 1.0)
+    _filled_circle(cx, cy, R + thick + 4)
+
+    # Arc: 7-o'clock (225°) sweeping CW 270° to 5-o'clock (-45°).
+    # OpenGL Y-up: CW = decreasing angle in radians.
+    A0    = math.radians(225.)
+    SWEEP = math.radians(-270.)
+
+    # ── step 1: full dim track (shows the dial range) ────────────
+    glColor4f(0.20, 0.20, 0.22, 1.0)
+    _ring_arc(cx, cy, R + thick, A0, A0 + SWEEP, thick)
+
+    # ── step 2: lit colour arc (0 → current speed) ───────────────
+    for lo, hi, col in _SPD_COLS:
+        f_lo = lo  / max_s
+        f_hi = min(hi, max_s) / max_s
+        if frac <= f_lo:
+            break                             # not reached this zone
+        f_draw = min(frac, f_hi)
+        ta = A0 + f_lo   * SWEEP
+        tb = A0 + f_draw * SWEEP
+        glColor3f(*_hex(col))
+        _ring_arc(cx, cy, R + thick, ta, tb, thick)
+
+    # ── tick marks ──────────────────────────────────────────────
+    for v in range(0, int(max_s) + 1, 20):
+        ang = A0 + (v / max_s) * SWEEP
+        ca, sa = math.cos(ang), math.sin(ang)
+        maj = (v % 40 == 0)
+        inner = R - 6 if maj else R
+        glColor3f(0.88,0.88,0.88) if maj else glColor3f(0.38,0.38,0.42)
+        glLineWidth(2.5 if maj else 1.2)
+        glBegin(GL_LINES)
+        glVertex2f(cx + inner*(ca), cy + inner*(sa))
+        glVertex2f(cx + (R+thick)*ca, cy + (R+thick)*sa)
+        glEnd()
+    glLineWidth(1.)
+
+    # ── needle (orange-red, easy to see) ────────────────────────
+    nang = A0 + frac * SWEEP
+    nca, nsa = math.cos(nang), math.sin(nang)
+    glColor4f(0.,0.,0.,0.55); glLineWidth(6.)   # shadow
+    glBegin(GL_LINES)
+    glVertex2f(cx-nca*16+1, cy-nsa*16-1)
+    glVertex2f(cx+nca*(R-5)+1, cy+nsa*(R-5)-1)
+    glEnd()
+    glColor3f(1.0, 0.28, 0.08); glLineWidth(3.)  # needle
+    glBegin(GL_LINES)
+    glVertex2f(cx-nca*16, cy-nsa*16)
+    glVertex2f(cx+nca*(R-5), cy+nsa*(R-5))
+    glEnd()
+    glLineWidth(1.)
+
+    # ── hub ─────────────────────────────────────────────────────
+    glColor3f(0.14,0.14,0.18); _filled_circle(cx, cy, 12)
+    glColor3f(1.0, 0.28, 0.08); _filled_circle(cx, cy,  6)
+
+    # ── digital readout ─────────────────────────────────────────
+    lbl = str(int(spd_kmh))
+    dw=28.; dh=42.; dgap=6.
+    total_w = len(lbl)*dw + (len(lbl)-1)*dgap
+    # place digits at gauge centre (cy), shifted down a little
+    dcx = cx;  dcy_base = cy - 22.
+    dx0 = dcx - total_w/2.
+
+    # solid pill background — clearly visible
+    pad=8.
+    glColor4f(0.08, 0.08, 0.12, 1.0)
+    glBegin(GL_QUADS)
+    glVertex2f(dx0-pad,           dcy_base-pad)
+    glVertex2f(dx0+total_w+pad,   dcy_base-pad)
+    glVertex2f(dx0+total_w+pad,   dcy_base+dh+pad)
+    glVertex2f(dx0-pad,           dcy_base+dh+pad)
+    glEnd()
+
+    # dim "ghost" segments (inactive segments, very faint)
+    glColor4f(0.20, 0.20, 0.24, 1.0)
+    for i,_ in enumerate(lbl):
+        _draw_digit(dx0+i*(dw+dgap)+dw/2., dcy_base+dh/2., dw, dh, (1,1,1,1,1,1,1))
+
+    # bright active segments
+    glColor3f(0.96, 1.0, 0.72)    # warm yellow-white LCD colour
+    for i,ch in enumerate(lbl):
+        _draw_digit(dx0+i*(dw+dgap)+dw/2., dcy_base+dh/2., dw, dh, _SEG7.get(ch,(1,)*7))
+
+    # ── km/h label ──────────────────────────────────────────────
+    ky = dcy_base - pad - 10.
+    glColor3f(0.50, 0.52, 0.58)
+    glLineWidth(1.5)
+    ox = dcx - 18.
+    glBegin(GL_LINES)
+    # K
+    glVertex2f(ox,   ky-6); glVertex2f(ox,   ky+6)
+    glVertex2f(ox,   ky);   glVertex2f(ox+5, ky+6)
+    glVertex2f(ox,   ky);   glVertex2f(ox+5, ky-6)
+    # M  (gap 8)
+    glVertex2f(ox+8,  ky-6); glVertex2f(ox+8,  ky+6)
+    glVertex2f(ox+8,  ky+6); glVertex2f(ox+11, ky+1)
+    glVertex2f(ox+11, ky+1); glVertex2f(ox+14, ky+6)
+    glVertex2f(ox+14, ky+6); glVertex2f(ox+14, ky-6)
+    # /  (gap 4)
+    glVertex2f(ox+18, ky-6); glVertex2f(ox+21, ky+6)
+    # H  (gap 3)
+    glVertex2f(ox+24, ky-6); glVertex2f(ox+24, ky+6)
+    glVertex2f(ox+24, ky);   glVertex2f(ox+29, ky)
+    glVertex2f(ox+29, ky-6); glVertex2f(ox+29, ky+6)
+    glEnd()
+    glLineWidth(1.)
+
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+    glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glEnable(GL_FOG)
+
+# ═══════════════════════════════════════════════════════
+#  BOUNDARY WARNING VIGNETTE
+# ═══════════════════════════════════════════════════════
+def draw_boundary_flash(intensity):
+    if intensity<=0.: return
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0,WIN_W,0,WIN_H,-1,1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    a=intensity*0.55
+    # border strips (4 edges)
+    bw=80
+    glColor4f(0.8,0.1,0.05,a)
+    for (x0,y0,x1,y1) in [(0,0,WIN_W,bw),(0,WIN_H-bw,WIN_W,WIN_H),
+                           (0,0,bw,WIN_H),(WIN_W-bw,0,WIN_W,WIN_H)]:
+        glBegin(GL_QUADS)
+        glVertex2f(x0,y0); glVertex2f(x1,y0)
+        glVertex2f(x1,y1); glVertex2f(x0,y1)
+        glEnd()
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW); glPopMatrix()
+    glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glEnable(GL_FOG)
+
+# ═══════════════════════════════════════════════════════
+#  VEHICLE SELECTOR HUD
+# ═══════════════════════════════════════════════════════
+_VCOLS={'car':(0.04,0.52,0.90),'coach':(0.14,0.34,0.72),
+        'truck':(0.20,0.38,0.65),'motorbike':(0.14,0.14,0.16)}
+
+def draw_hud(current):
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_FOG)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity(); glOrtho(0,WIN_W,0,WIN_H,-1,1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    tw,gap,bh,sh=84,10,20,34
+    total=(4*tw+3*gap); x0=(WIN_W-total)//2
+    for idx,vn in enumerate(VNAMES):
+        x=x0+idx*(tw+gap); sel=(vn==current); h=sh if sel else bh
+        r,g,b=_VCOLS[vn]
+        glColor4f(r*.25,g*.25,b*.25,0.78)
+        glBegin(GL_QUADS)
+        glVertex2f(x,0); glVertex2f(x+tw,0); glVertex2f(x+tw,h); glVertex2f(x,h)
+        glEnd()
+        stripe=7 if sel else 3
+        glColor4f(r,g,b,1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(x,h-stripe); glVertex2f(x+tw,h-stripe)
+        glVertex2f(x+tw,h);     glVertex2f(x,h)
+        glEnd()
+        glColor4f(0.85,0.85,0.85,0.9)
+        kx=x+5; ky=h-stripe-11
+        glBegin(GL_QUADS)
+        glVertex2f(kx,ky); glVertex2f(kx+9,ky)
+        glVertex2f(kx+9,ky+8); glVertex2f(kx,ky+8)
+        glEnd()
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW); glPopMatrix()
+    glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING); glEnable(GL_FOG)
+
+# ═══════════════════════════════════════════════════════
+#  OPENGL SETUP
+# ═══════════════════════════════════════════════════════
+def setup_gl(w,h):
+    global WIN_W,WIN_H; WIN_W,WIN_H=w,h
+    glClearColor(*SKY_BOT,1.)
+    glEnable(GL_DEPTH_TEST); glDepthFunc(GL_LEQUAL)
+    glEnable(GL_LIGHTING);   glEnable(GL_LIGHT0)
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK,GL_AMBIENT_AND_DIFFUSE)
+    glLightfv(GL_LIGHT0,GL_POSITION,[0.5,1.,0.4,0.])
+    glLightfv(GL_LIGHT0,GL_DIFFUSE, [0.88,0.88,0.82,1.])
+    glLightfv(GL_LIGHT0,GL_AMBIENT, [0.30,0.30,0.34,1.])
+    glLightfv(GL_LIGHT0,GL_SPECULAR,[0.,0.,0.,1.])
+    glEnable(GL_FOG); glFogi(GL_FOG_MODE,GL_EXP2)
+    glFogfv(GL_FOG_COLOR,FOG_COL); glFogf(GL_FOG_DENSITY,0.0072)
+    glFogf(GL_FOG_START,80.); glFogf(GL_FOG_END,360.)
+    glHint(GL_FOG_HINT,GL_NICEST)
+    glViewport(0,0,w,h)
+    glMatrixMode(GL_PROJECTION); glLoadIdentity()
+    gluPerspective(FOV,w/h,NEAR,FAR)
+    glMatrixMode(GL_MODELVIEW)
+
+# ═══════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════
+def main():
+    global WIN_W, WIN_H
+    pygame.init()
+
+    # Start fullscreen at native resolution
+    info = pygame.display.Info()
+    native_w, native_h = info.current_w, info.current_h
+    fullscreen = True
+    flags = DOUBLEBUF|OPENGL|FULLSCREEN
+    pygame.display.set_mode((native_w, native_h), flags)
+    pygame.display.set_caption("Slow Roads UK  ·  F11=window  ·  ESC=quit")
+    clock = pygame.time.Clock()
+    setup_gl(native_w, native_h)
+
+    road   = Road()
+    player = Player(road,'car')
+    cam    = Camera(); cam.setveh('car')
+    p0,t0,_=road.get(5)
+    back0=np.array([-t0[0],0.,-t0[2]]); back0/=np.linalg.norm(back0)+1e-9
+    cam._eye=p0+back0*cam._cb+np.array([0.,cam._cu,0.])
+    cam._at =p0+t0*5.
+
+    rclick=False; frame=0
+
+    while True:
+        dt=min(clock.tick(60)/1000.,0.05); frame+=1
+
+        for ev in pygame.event.get():
+            if ev.type==QUIT: pygame.quit(); sys.exit()
+            if ev.type==KEYDOWN:
+                if ev.key==K_ESCAPE: pygame.quit(); sys.exit()
+                if ev.key==K_F11:
+                    fullscreen = not fullscreen
+                    if fullscreen:
+                        pygame.display.set_mode((native_w,native_h), DOUBLEBUF|OPENGL|FULLSCREEN)
+                        setup_gl(native_w, native_h)
+                    else:
+                        ww,wh = min(native_w,1280), min(native_h,720)
+                        pygame.display.set_mode((ww,wh), DOUBLEBUF|OPENGL|RESIZABLE)
+                        setup_gl(ww, wh)
+                vm={K_1:'car',K_2:'coach',K_3:'truck',K_4:'motorbike'}
+                if ev.key in vm:
+                    nv=vm[ev.key]
+                    if nv!=player.veh: player.veh=nv; cam.setveh(nv)
+            if ev.type==VIDEORESIZE:
+                setup_gl(ev.w, ev.h)
+            if ev.type==MOUSEBUTTONDOWN and ev.button==3:
+                rclick=True; pygame.mouse.get_rel()
+            if ev.type==MOUSEBUTTONUP and ev.button==3: rclick=False
+            if ev.type==MOUSEMOTION and rclick:
+                rx,ry=ev.rel
+                cam.oyaw  -=rx*0.35
+                cam.opitch=max(-28.,min(52.,cam.opitch+ry*0.28))
+
+        if not rclick:
+            decay=1.-min(1.,3.5*dt)
+            cam.oyaw*=decay; cam.opitch*=decay
+
+        keys=pygame.key.get_pressed()
+        player.update(road,keys,dt)
+        cam.update(player,dt)
+
+        if frame%30==0:
+            kmh=abs(player.speed)*3.6
+            mode="FS" if fullscreen else "Win"
+            pygame.display.set_caption(
+                f"Slow Roads UK  ·  {player.veh.capitalize()}  ·  "
+                f"{kmh:.0f} km/h  ·  1-4=veh  F11={mode}  ESC=quit")
+
+        # ── render ────────────────────────────────────
+        glClear(GL_COLOR_BUFFER_BIT)
+        draw_sky()
+        glClear(GL_DEPTH_BUFFER_BIT)
+        cam.apply()
+        glLightfv(GL_LIGHT0,GL_POSITION,[0.5,1.,0.4,0.])
+
+        ci=player.near
+        draw_terrain(road,ci)
+        draw_road_skirts(road,ci)
+        draw_road(road,ci)
+        draw_bridge_pillars(road,ci)
+        draw_vehicle(player)
+        draw_trees(player.pos, road, player.near)
+
+        # ── 2-D overlays ──────────────────────────────
+        draw_boundary_flash(player.at_boundary)
+        draw_speedometer(player)
+        draw_hud(player.veh)
+
+        pygame.display.flip()
+
+if __name__=="__main__":
+    main()
