@@ -6,3 +6,7 @@ V1.0
 No procedural generation yet. 
 Still looks bad.
 rough roads.
+Horribly modelled vehicles.
+No ui yet.
+No shift boost.
+No sounds.
