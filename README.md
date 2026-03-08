@@ -1,7 +1,7 @@
 # Pyroads
 Pyroads is a driving simulator inspired by the website slowroads.io. 
 
-Escape the rush and take the scenic route with Pyroads — a beautifully calming driving experience right in your browser. Cruise endlessly through stunning procedurally generated landscapes, from rolling hills and quiet forests to snowy mountains and peaceful coastlines. There are no timers, no traffic, and no pressure — just smooth driving, relaxing scenery, and the freedom to wander.
+Escape the rush and take the scenic route with Pyroads — a beautifully calming driving experience right in your own python app. Cruise endlessly through stunning procedurally generated landscapes, from rolling hills and quiet forests to snowy mountains and peaceful coastlines. There are no timers, no traffic, and no pressure — just smooth driving, relaxing scenery, and the freedom to wander.
 
 Whether you need a break from work, a moment to relax, or simply enjoy the feeling of the open road, Pyroads lets you unwind at your own pace. Start your journey, breathe, and let the road stretch on forever. (This sentence is definitely not generated in gpt)
 
