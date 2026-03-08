@@ -7,6 +7,8 @@ Whether you need a break from work, a moment to relax, or simply enjoy the feeli
 
 # Pyroads — Drive. Relax. Repeat.
 
+v1.2 glitched it'll take one week to fix (terrain roads and veicles and ui glitched)
+
 <img width="1270" height="721" alt="image" src="https://github.com/user-attachments/assets/09ce72a2-325b-4efa-b74e-8d8703a6b4aa" />
 
 v1.1
