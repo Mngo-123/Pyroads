@@ -7,6 +7,13 @@ Whether you need a break from work, a moment to relax, or simply enjoy the feeli
 
 # Pyroads — Drive. Relax. Repeat.
 
+v1.2.1 more hills less lakes, better road generation. remodeled all except motorbike, shift to boost added, speednometer remade, reoptimised
+
+<img width="1269" height="702" alt="image" src="https://github.com/user-attachments/assets/5eefd265-6cdb-4b2b-b151-d9c13fa3ddb2" />
+v1.2.1
+new cars new bus new truck (still remodeling them)
+more trees, better bridges, less hills unfortuantly for the lakes I'll try to add more hills. press c for new driver camera (tilt will be fixed) 
+
 v1.2 in one part scrapped
 
 <img width="1270" height="721" alt="image" src="https://github.com/user-attachments/assets/09ce72a2-325b-4efa-b74e-8d8703a6b4aa" />
