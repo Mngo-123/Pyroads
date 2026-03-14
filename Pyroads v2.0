@@ -1,0 +1,1535 @@
+#!/usr/bin/env python3
+"""
+Pyroads 2.0 – Infinite UK countryside drive · PyOpenGL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+pip install pygame PyOpenGL PyOpenGL_accelerate numpy
+python "Pyroads v2.0"
+
+Controls
+  W/Up       accelerate        S/Down     brake/reverse
+  A/Left     steer left        D/Right    steer right
+  1-6        select vehicle    C          toggle camera
+  RMB drag   orbit camera      Scroll     zoom
+  F11        toggle fullscreen M          toggle minimap
+  P          pause             H          toggle HUD
+  ESC        quit
+"""
+import sys, math, random
+import numpy as np
+import pygame
+from pygame.locals import *
+from OpenGL.GL  import *
+from OpenGL.GLU import *
+
+# ═══════════════════════════════════════════════════════
+#  PERLIN NOISE (optimized)
+# ═══════════════════════════════════════════════════════
+def _bperm(seed=42):
+    rng = np.random.default_rng(seed)
+    p = np.arange(256, dtype=np.int32)
+    rng.shuffle(p)
+    return np.tile(p, 2)
+
+_PM = _bperm(42)
+
+def _fa(t):
+    return t * t * t * (t * (t * 6 - 15) + 10)
+
+def _lp(a, b, t):
+    return a + t * (b - a)
+
+def _g2(h, x, y):
+    return (x + y, -x + y, x - y, -x - y)[h & 3]
+
+def _p2(x, y):
+    xi = int(math.floor(x)) & 255
+    yi = int(math.floor(y)) & 255
+    xf = x - math.floor(x)
+    yf = y - math.floor(y)
+    u = _fa(xf)
+    v = _fa(yf)
+    P = _PM
+    return _lp(_lp(_g2(P[P[xi] + yi], xf, yf), _g2(P[P[xi + 1] + yi], xf - 1, yf), u),
+               _lp(_g2(P[P[xi] + yi + 1], xf, yf - 1), _g2(P[P[xi + 1] + yi + 1], xf - 1, yf - 1), u), v)
+
+def pn(x, y, oc=1, pe=0.5):
+    v = 0.
+    a = 1.
+    f = 1.
+    ma = 0.
+    for _ in range(oc):
+        v += _p2(x * f, y * f) * a
+        ma += a
+        a *= pe
+        f *= 2.
+    return v / ma
+
+# ═══════════════════════════════════════════════════════
+#  CONSTANTS
+# ═══════════════════════════════════════════════════════
+WIN_W, WIN_H = 0, 0
+FOV = 68.0
+NEAR, FAR = 0.2, 400.0
+ROAD_W = 7.2
+SEG_L = 3.5
+DRAW_AH = 70
+DRAW_BH = 14
+WATER_Y = -1.4
+BRDG_CLR = 2.4
+MAX_LAT = 130.0
+SEA_COL = (0.10, 0.20, 0.34)
+
+# Coast noise
+def _cn(x, z):
+    return pn(x * 0.000360, z * 0.000360)
+
+COAST_SEA = -0.20
+COAST_BEACH = -0.04
+
+SKY_TOP = (0.50, 0.58, 0.72)
+SKY_BOT = (0.68, 0.72, 0.80)
+FOG_COL = [0.68, 0.72, 0.80, 1.0]
+
+# Vehicle configs
+VCFG = {
+    'focus': dict(cb=10, cu=3.8, wb=2.6, ms=50, mr=14, ac=16, br=26, dr=1.0, gd=0.05, fwd_h=1.10, fwd_z=0.55),
+    'civic': dict(cb=10, cu=3.8, wb=2.6, ms=62, mr=16, ac=22, br=30, dr=1.0, gd=0.05, fwd_h=1.08, fwd_z=0.55),
+    'gemini2': dict(cb=22, cu=8.0, wb=7.5, ms=22, mr=7, ac=4, br=9, dr=0.55, gd=0.06, fwd_h=1.52, fwd_z=4.60),
+    'levante': dict(cb=26, cu=9.0, wb=7.5, ms=20, mr=6, ac=4, br=9, dr=0.55, gd=0.06, fwd_h=1.52, fwd_z=4.90),
+    'daf': dict(cb=26, cu=9.0, wb=5.5, ms=24, mr=7, ac=4, br=10, dr=0.58, gd=0.06, fwd_h=2.20, fwd_z=4.00),
+    'honda_cb': dict(cb=8, cu=2.8, wb=1.5, ms=60, mr=18, ac=22, br=30, dr=1.10, gd=0.03, fwd_h=1.00, fwd_z=0.45),
+}
+VNAMES = ['focus', 'civic', 'gemini2', 'levante', 'daf', 'honda_cb']
+
+# ═══════════════════════════════════════════════════════
+#  TERRAIN
+# ═══════════════════════════════════════════════════════
+def th(x, z):
+    cn = _cn(x, z)
+    if cn < COAST_SEA:
+        d = min(1.0, (COAST_SEA - cn) / 0.22)
+        return WATER_Y - 1.0 - d * 9.0
+    if cn < COAST_BEACH:
+        t = (cn - COAST_SEA) / (COAST_BEACH - COAST_SEA)
+        return WATER_Y + 0.05 + t * 3.5
+    inland_s = min(1.0, (cn - COAST_BEACH) / 0.12)
+    mac = pn(x * 0.0014, z * 0.0014)
+    hil = pn(x * 0.006, z * 0.006, oc=3, pe=0.48)
+    mic = pn(x * 0.055, z * 0.055)
+    if mac < -0.48:
+        return (-3.0 + mac * 4.0) * max(0.2, inland_s)
+    if mac < 0.08:
+        t = (mac + 0.28) / 0.36
+        return (hil * (3.0 + t * 7.0) + mic * 0.5) * inland_s
+    if mac < 0.40:
+        t = (mac - 0.08) / 0.32
+        return hil * (20.0 + t * 60.0) + mic * 3.0 + mac * 20.0
+    if mac < 0.65:
+        t = (mac - 0.40) / 0.25
+        return hil * (80.0 + t * 150.0) + mic * 8.0 + mac * 40.0
+    t = min(1.0, (mac - 0.65) / 0.20)
+    return hil * (200.0 + t * 300.0) + mic * 15.0 + mac * 60.0
+
+def _mac(x, z):
+    cn = _cn(x, z)
+    if cn < COAST_SEA:
+        return -0.60
+    if cn < COAST_BEACH:
+        return -0.10
+    v = pn(x * 0.0014, z * 0.0014)
+    if v < -0.48:
+        return -0.60
+    return v
+
+def tcol(h, coastal=False):
+    if h < WATER_Y - 0.5:
+        d = min(1.0, (WATER_Y - 0.5 - h) / 8.0)
+        return (0.08 + d * 0.03, 0.16 + d * 0.06, 0.32 + d * 0.10)
+    if h < WATER_Y + 0.15:
+        return (0.62, 0.56, 0.40)
+    if coastal and h < WATER_Y + 1.6:
+        t = (h - WATER_Y - 0.15) / 1.45
+        return (0.80 - t * 0.10, 0.70 - t * 0.12, 0.44 - t * 0.10)
+    if h < 5.0:
+        t = max(0., min(1., (h - WATER_Y - 1.6) / 3.4))
+        return (0.30 + t * .06, 0.42 + t * .02, 0.22 + t * .01)
+    if h < 30.0:
+        t = (h - 5.0) / 25.0
+        return (0.33 + t * .09, 0.40 - t * .08, 0.22 - t * .04)
+    if h < 120.0:
+        t = (h - 30.0) / 90.0
+        return (0.42 + t * .10, 0.26 - t * .04, 0.28 + t * .06)
+    if h < 280.0:
+        t = (h - 120.0) / 160.0
+        return (0.52 + t * .05, 0.22 - t * .03, 0.32 - t * .07)
+    t = min(1.0, (h - 280.0) / 320.0)
+    return (0.55 + t * .14, 0.50 + t * .08, 0.48 + t * .08)
+
+WCOL = SEA_COL
+
+def th_s(x, z):
+    cn = _cn(x, z)
+    if cn < COAST_SEA:
+        d = min(1.0, (COAST_SEA - cn) / 0.22)
+        return WATER_Y - 1.0 - d * 9.0
+    if cn < COAST_BEACH:
+        t = (cn - COAST_SEA) / (COAST_BEACH - COAST_SEA)
+        return WATER_Y + 0.05 + t * 3.5
+    inland_s = min(1.0, (cn - COAST_BEACH) / 0.12)
+    mac = pn(x * 0.0014, z * 0.0014)
+    hil = pn(x * 0.006, z * 0.006, oc=2, pe=0.48)
+    if mac < -0.48:
+        return (-3.0 + mac * 4.0) * max(0.2, inland_s)
+    if mac < 0.08:
+        return (hil * (3.0 + (mac + 0.28) / 0.36 * 7.0)) * inland_s
+    if mac < 0.40:
+        return hil * (20.0 + (mac - 0.08) / 0.32 * 60.0) + mac * 20.0
+    if mac < 0.65:
+        return hil * (80.0 + (mac - 0.40) / 0.25 * 150.0) + mac * 40.0
+    return hil * (200.0 + min(1.0, (mac - 0.65) / 0.20) * 300.0) + mac * 60.0
+
+_THC = {}
+_THCG = 2.0
+
+def th_c(x, z):
+    k = (int(round(x / _THCG)), int(round(z / _THCG)))
+    v = _THC.get(k)
+    if v is None:
+        if len(_THC) > 40000:
+            _THC.clear()
+        _THC[k] = v = th(k[0] * _THCG, k[1] * _THCG)
+    return v
+
+_NE = 3.5
+
+def terrain_normal(x, z):
+    hL = th_s(x - _NE, z)
+    hR = th_s(x + _NE, z)
+    hB = th_s(x, z - _NE)
+    hF = th_s(x, z + _NE)
+    tx = np.array([2. * _NE, hR - hL, 0.])
+    tz = np.array([0., hF - hB, 2. * _NE])
+    n = np.cross(tz, tx)
+    nl = np.linalg.norm(n)
+    return n / nl if nl > 1e-8 else np.array([0., 1., 0.])
+
+# ═══════════════════════════════════════════════════════
+#  ROAD
+# ═══════════════════════════════════════════════════════
+class Road:
+    def __init__(self):
+        self.pts = []
+        self.tans = []
+        self.nors = []
+        self._br = []
+        self._ang = 0.
+        self._pos = np.zeros(3, dtype=np.float64)
+        self._grow(DRAW_BH + DRAW_AH + 80)
+
+    def _grow(self, tgt):
+        while len(self.pts) < tgt:
+            i = len(self.pts)
+            self._ang += pn(i * 0.008, 2.7) * 0.055
+            dx = math.sin(self._ang) * SEG_L
+            dz = -math.cos(self._ang) * SEG_L
+            nxt = self._pos + np.array([dx, 0., dz])
+            offsets = [(ox, oz) for ox in (-10, 0, 10) for oz in (-10, 0, 10)]
+            h_avg = sum(th_s(float(nxt[0] + ox), float(nxt[2] + oz)) for ox, oz in offsets) / 9.
+            if not hasattr(self, '_hb'):
+                self._hb = h_avg
+            self._hb += max(-0.32, min(0.22, (h_avg - self._hb) * 0.10))
+            mac_here = _mac(float(nxt[0]), float(nxt[2]))
+            over_water = (mac_here < -0.50)
+            ty = (WATER_Y + BRDG_CLR) if over_water else max(WATER_Y + 0.05, self._hb + 0.12)
+            dy = max(-0.32, min(0.22, (ty - float(self._pos[1])) * 0.10))
+            new = self._pos + np.array([dx, dy, dz])
+            if not over_water:
+                g2 = th_s(float(new[0]), float(new[2]))
+                abs_floor = g2 + 0.05 if g2 > WATER_Y else WATER_Y + BRDG_CLR
+                if new[1] < abs_floor:
+                    new[1] = min(abs_floor, float(new[1]) + 0.22)
+                self._hb = float(new[1])
+            tan = new - self._pos
+            tan /= np.linalg.norm(tan) + 1e-9
+            nor = np.array([tan[2], 0., -tan[0]])
+            nor /= np.linalg.norm(nor) + 1e-9
+            self.pts.append(new.copy())
+            self.tans.append(tan.copy())
+            self.nors.append(nor.copy())
+            self._br.append(over_water)
+            self._pos = new
+
+    def get(self, i):
+        self._grow(i + 40)
+        return self.pts[i], self.tans[i], self.nors[i]
+
+    def bridge(self, i):
+        self._grow(i + 40)
+        return self._br[i] if i < len(self._br) else False
+
+# ═══════════════════════════════════════════════════════
+#  PLAYER
+# ═══════════════════════════════════════════════════════
+def _nearest_seg(pos, road, hint, win=60):
+    px, pz = float(pos[0]), float(pos[2])
+    road.get(hint + win + 10)
+    bi, bd = hint, 1e18
+    for i in range(max(0, hint - win // 3), hint + win):
+        p = road.get(i)[0]
+        d = (float(p[0]) - px) ** 2 + (float(p[2]) - pz) ** 2
+        if d < bd:
+            bd = d
+            bi = i
+    return bi
+
+class Player:
+    def __init__(self, road, veh='focus'):
+        p0, t0, _ = road.get(5)
+        self.pos = p0.copy()
+        self.pos[1] = max(WATER_Y, th_s(*map(float, [p0[0], p0[2]]))) + 0.08
+        self.heading = math.atan2(float(t0[0]), -float(t0[2]))
+        self.speed = 0.
+        self.steer = 0.
+        self.veh = veh
+        self.near = 5
+        self.surf_up = np.array([0., 1., 0.])
+        self.at_boundary = 0.
+
+    def update(self, road, keys, dt):
+        c = VCFG[self.veh]
+        if keys[K_UP] or keys[K_w]:
+            self.speed = min(c['ms'], self.speed + c['ac'] * dt)
+        elif keys[K_DOWN] or keys[K_s]:
+            self.speed = (max(0., self.speed - c['br'] * dt) if self.speed > 0.3
+                          else max(-c['mr'], self.speed - c['ac'] * 0.55 * dt))
+        else:
+            self.speed *= 1. - min(1., c['dr'] * dt)
+            if abs(self.speed) < 0.05:
+                self.speed = 0.
+        si = 0.
+        if keys[K_LEFT] or keys[K_a]:
+            si = -1.
+        if keys[K_RIGHT] or keys[K_d]:
+            si = 1.
+        self.steer += (si - self.steer) * min(1., 6. * dt)
+        v_eff = math.copysign(min(abs(self.speed), 9.), self.speed)
+        self.heading += self.steer * math.radians(c['wb'] * 4.5) / c['wb'] * v_eff * dt
+        fv = np.array([math.sin(self.heading), 0., -math.cos(self.heading)])
+        self.pos = self.pos + fv * self.speed * dt
+        px, pz = float(self.pos[0]), float(self.pos[2])
+        self.near = _nearest_seg(self.pos, road, self.near)
+        rp, _, rn = road.get(self.near)
+        xzd = math.hypot(px - float(rp[0]), pz - float(rp[2]))
+        on_road = xzd < ROAD_W * 0.55
+        br = road.bridge(self.near)
+        if on_road:
+            ty = float(rp[1]) + c['gd']
+        elif br:
+            ty = max(WATER_Y, th_c(px, pz)) + c['gd']
+        else:
+            edge_d = max(0., xzd - ROAD_W * 0.5)
+            gnd_raw = th_c(px, pz)
+            h = _blended_h(gnd_raw, float(rp[1]), edge_d, br)
+            ty = max(WATER_Y, h) + c['gd']
+        self.pos[1] += (ty - self.pos[1]) * min(1., 18. * dt)
+        tn = terrain_normal(px, pz)
+        self.surf_up += (tn - self.surf_up) * min(1., 8. * dt)
+        sl = np.linalg.norm(self.surf_up)
+        if sl > 1e-6:
+            self.surf_up /= sl
+        diff = self.pos - rp
+        lat = float(np.dot(diff, rn))
+        lat_abs = abs(lat)
+        if br and lat_abs > ROAD_W * 0.5:
+            self.pos -= rn * (lat - math.copysign(ROAD_W * 0.5, lat))
+            fv = self.fwd()
+            _, rt, _ = road.get(self.near)
+            vn_into = float(np.dot(fv, rn)) * math.copysign(1., lat)
+            if vn_into > 0.05:
+                vt = float(np.dot(fv, rt))
+                slide = rt if vt >= 0. else -rt
+                new_h = math.atan2(float(slide[0]), -float(slide[2]))
+                dh = new_h - self.heading
+                while dh > math.pi:
+                    dh -= 2 * math.pi
+                while dh < -math.pi:
+                    dh += 2 * math.pi
+                self.heading += dh * min(1., vn_into * 2.5)
+                self.speed *= max(0.75, 1. - vn_into * 0.35)
+            lat = math.copysign(ROAD_W * 0.5, lat)
+            lat_abs = ROAD_W * 0.5
+        self.at_boundary = max(0., min(1., (lat_abs - MAX_LAT * 0.7) / (MAX_LAT * 0.3)))
+        if lat_abs > MAX_LAT:
+            self.pos -= rn * (lat - math.copysign(MAX_LAT, lat))
+
+    def fwd(self):
+        return np.array([math.sin(self.heading), 0., -math.cos(self.heading)])
+
+    def rgt(self):
+        return np.array([math.cos(self.heading), 0., math.sin(self.heading)])
+
+    def sfwd(self):
+        f = self.fwd()
+        n = self.surf_up
+        fp = f - n * float(np.dot(f, n))
+        fl = np.linalg.norm(fp)
+        return fp / fl if fl > 1e-6 else f
+
+    def srgt(self):
+        r = np.cross(self.sfwd(), self.surf_up)
+        rl = np.linalg.norm(r)
+        return r / rl if rl > 1e-6 else self.rgt()
+
+    def lean(self):
+        return -self.steer * min(1., abs(self.speed) / 5.) * 22.
+
+# ═══════════════════════════════════════════════════════
+#  CAMERA
+# ═══════════════════════════════════════════════════════
+class Camera:
+    def __init__(self):
+        self._eye = np.zeros(3)
+        self._at = np.zeros(3)
+        self.oyaw = 0.
+        self.opitch = 0.
+        self._cb = 12.
+        self._cu = 4.5
+        self.zoom = 1.0
+        self.mode = 0
+        self._tilt = 0.
+
+    def setveh(self, v):
+        self._cb = float(VCFG[v]['cb'])
+        self._cu = float(VCFG[v]['cu'])
+
+    def update(self, pl, dt):
+        c = VCFG[pl.veh]
+        f = pl.sfwd()
+        up = pl.surf_up
+        if self.mode == 0:
+            back = np.array([-f[0], 0., -f[2]])
+            bl = np.linalg.norm(back)
+            if bl > 1e-6:
+                back /= bl
+            we = pl.pos + back * self._cb * self.zoom + np.array([0., self._cu * self.zoom, 0.])
+            wa = pl.pos + f * 5.
+            self._tilt *= (1. - min(1., 6. * dt))
+        else:
+            fwd_h = float(c.get('fwd_h', 1.10))
+            fwd_z = float(c.get('fwd_z', 0.90))
+            we = pl.pos + f * fwd_z + up * fwd_h
+            wa = pl.pos + f * (fwd_z + 20.)
+            tgt_tilt = pl.steer * min(1., abs(pl.speed) / 6.) * 7.0
+            self._tilt += (tgt_tilt - self._tilt) * min(1., 8. * dt)
+        a = min(1., 10. * dt)
+        self._eye += (we - self._eye) * a
+        self._at += (wa - self._at) * a
+
+    def apply(self):
+        arm = self._eye - self._at
+        yr = math.radians(self.oyaw)
+        cy, sy = math.cos(yr), math.sin(yr)
+        arm = np.array([cy * arm[0] + sy * arm[2], arm[1], -sy * arm[0] + cy * arm[2]])
+        rgt = np.cross(arm, [0., 1., 0.])
+        rl = np.linalg.norm(rgt)
+        if rl < 1e-6:
+            rgt = np.array([1., 0., 0.])
+        else:
+            rgt /= rl
+        pr = math.radians(self.opitch)
+        cp, sp = math.cos(pr), math.sin(pr)
+        arm = arm * cp + np.cross(rgt, arm) * sp + rgt * float(np.dot(rgt, arm)) * (1. - cp)
+        eye = self._at + arm
+        tilt_r = math.radians(self._tilt) if self.mode == 1 else 0.
+        ct, st = math.cos(tilt_r), math.sin(tilt_r)
+        fwd_n = arm / max(1e-6, np.linalg.norm(arm))
+        right = np.cross(fwd_n, [0., 1., 0.])
+        right /= max(1e-6, np.linalg.norm(right))
+        world_up = np.array([0., 1., 0.])
+        cam_up = world_up * ct + right * st
+        glLoadIdentity()
+        gluLookAt(float(eye[0]), float(eye[1]), float(eye[2]),
+                  float(self._at[0]), float(self._at[1]), float(self._at[2]),
+                  float(cam_up[0]), float(cam_up[1]), float(cam_up[2]))
+
+# ═══════════════════════════════════════════════════════
+#  SKY & SEA
+# ═══════════════════════════════════════════════════════
+def draw_sky():
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_FOG)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, 1, 0, 1, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glBegin(GL_QUADS)
+    glColor3f(*SKY_BOT)
+    glVertex2f(0, 0)
+    glVertex2f(1, 0)
+    glColor3f(*SKY_TOP)
+    glVertex2f(1, 1)
+    glVertex2f(0, 1)
+    glEnd()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_FOG)
+
+def draw_sea(player_pos):
+    px, pz = float(player_pos[0]), float(player_pos[2])
+    glDisable(GL_LIGHTING)
+    glEnable(GL_FOG)
+    glColor3f(*SEA_COL)
+    glNormal3f(0, 1, 0)
+    SR = FAR * 0.94
+    glBegin(GL_QUADS)
+    glVertex3f(px - SR, WATER_Y - 0.05, pz - SR)
+    glVertex3f(px + SR, WATER_Y - 0.05, pz - SR)
+    glVertex3f(px + SR, WATER_Y - 0.05, pz + SR)
+    glVertex3f(px - SR, WATER_Y - 0.05, pz + SR)
+    glEnd()
+    glEnable(GL_LIGHTING)
+
+# ═══════════════════════════════════════════════════════
+#  TERRAIN & ROAD
+# ═══════════════════════════════════════════════════════
+STRIPS = 12
+STRIP_W = 11.0
+FLAT_R = 26.0
+
+def _blended_h(h_raw, ry, edge_d, is_bridge):
+    if is_bridge:
+        return WATER_Y
+    if edge_d < FLAT_R:
+        t = edge_d / FLAT_R
+        bt = t * t * (3 - 2 * t)
+        return ry * (1 - bt) + h_raw * bt
+    return h_raw
+
+def draw_terrain(road, ci):
+    s = max(0, ci - DRAW_BH)
+    e = ci + DRAW_AH
+    half = ROAD_W * .5
+    glNormal3f(0, 1, 0)
+    for side in (-1., 1.):
+        for k in range(STRIPS):
+            id_ = half + k * STRIP_W
+            od_ = id_ + STRIP_W
+            glBegin(GL_QUAD_STRIP)
+            for i in range(s, e + 1):
+                p, _, n = road.get(i)
+                ry = float(p[1])
+                br = road.bridge(i)
+                for d in (id_, od_):
+                    pos = p + n * (side * d)
+                    px2, pz2 = float(pos[0]), float(pos[2])
+                    h_raw = th_c(px2, pz2)
+                    h = _blended_h(h_raw, ry, d - half, br)
+                    h = max(WATER_Y, h)
+                    if h <= WATER_Y + 0.05:
+                        glColor3f(*WCOL)
+                    else:
+                        glColor3f(*tcol(h, _cn(px2, pz2) < COAST_BEACH))
+                    glVertex3f(px2, h, pz2)
+            glEnd()
+
+def draw_road(road, ci):
+    s = max(0, ci - DRAW_BH)
+    e = ci + DRAW_AH
+    half = ROAD_W * .5
+    glDisable(GL_LIGHTING)
+    glBegin(GL_QUAD_STRIP)
+    for i in range(s, e + 1):
+        p, _, n = road.get(i)
+        glColor3f(*((0.50, 0.47, 0.42) if road.bridge(i) else (0.28, 0.28, 0.30)))
+        l = p - n * half
+        r = p + n * half
+        glVertex3f(float(l[0]), float(l[1]), float(l[2]))
+        glVertex3f(float(r[0]), float(r[1]), float(r[2]))
+    glEnd()
+    glColor3f(0.85, 0.85, 0.85)
+    glLineWidth(2.)
+    for sd in (-1., 1.):
+        glBegin(GL_LINE_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            ep = p + n * (sd * half)
+            glVertex3f(float(ep[0]), float(ep[1]), float(ep[2]))
+        glEnd()
+    glColor3f(0.92, 0.88, 0.60)
+    glLineWidth(1.5)
+    for i in range(s, e):
+        if (i % 5) < 3:
+            p0 = road.get(i)[0]
+            p1 = road.get(i + 1)[0]
+            glBegin(GL_LINES)
+            glVertex3f(float(p0[0]), float(p0[1]), float(p0[2]))
+            glVertex3f(float(p1[0]), float(p1[1]), float(p1[2]))
+            glEnd()
+    glLineWidth(1.)
+    glEnable(GL_LIGHTING)
+
+# ═══════════════════════════════════════════════════════
+#  BRIDGES
+# ═══════════════════════════════════════════════════════
+def _brhash(x, z):
+    return int((int(x * 7) ^ (int(z * 13) * 31)) & 0x7FFFFFFF)
+
+def _bridge_type(road, si):
+    p = road.get(si)[0]
+    return _brhash(float(p[0]), float(p[2])) % 2
+
+def _qbox(x, y, z, w, h, d):
+    hw, hh, hd = w * .5, h * .5, d * .5
+    cy = y + hh
+    faces = (
+        (0, 0, 1, (-hw, -hh, hd), (hw, -hh, hd), (hw, hh, hd), (-hw, hh, hd)),
+        (0, 0, -1, (hw, -hh, -hd), (-hw, -hh, -hd), (-hw, hh, -hd), (hw, hh, -hd)),
+        (1, 0, 0, (hw, -hh, -hd), (hw, -hh, hd), (hw, hh, hd), (hw, hh, -hd)),
+        (-1, 0, 0, (-hw, -hh, hd), (-hw, -hh, -hd), (-hw, hh, -hd), (-hw, hh, hd)),
+        (0, 1, 0, (-hw, hh, hd), (hw, hh, hd), (hw, hh, -hd), (-hw, hh, -hd)),
+        (0, -1, 0, (-hw, -hh, -hd), (hw, -hh, -hd), (hw, -hh, hd), (-hw, -hh, hd)),
+    )
+    glBegin(GL_QUADS)
+    for fnx, fny, fnz, v0, v1, v2, v3 in faces:
+        glNormal3f(fnx, fny, fnz)
+        for vx, vy, vz in (v0, v1, v2, v3):
+            glVertex3f(x + vx, cy + vy, z + vz)
+    glEnd()
+
+def _arch_curve(cx, bot, cz, w, h, btype):
+    if btype == 0:
+        glColor3f(0.52, 0.47, 0.40)
+        _qbox(cx, bot, cz, w * 1.50, h * 0.12, w * 1.30)
+        glColor3f(0.60, 0.55, 0.46)
+        _qbox(cx, bot + h * 0.12, cz, w * 1.20, h * 0.42, w * 1.10)
+        glColor3f(0.48, 0.43, 0.36)
+        _qbox(cx, bot + h * 0.54, cz, w * 1.30, h * 0.08, w * 1.20)
+        glColor3f(0.64, 0.59, 0.50)
+        _qbox(cx, bot + h * 0.62, cz, w * 1.15, h * 0.30, w * 1.05)
+        glColor3f(0.46, 0.42, 0.36)
+        _qbox(cx, bot + h * 0.92, cz, w * 1.35, h * 0.08, w * 1.25)
+    else:
+        glColor3f(0.65, 0.64, 0.62)
+        _qbox(cx, bot, cz, w * 1.40, h * 0.10, w * 1.20)
+        glColor3f(0.72, 0.71, 0.69)
+        _qbox(cx, bot + h * 0.10, cz, w * 1.10, h * 0.50, w * 0.95)
+        glColor3f(0.62, 0.61, 0.59)
+        _qbox(cx, bot + h * 0.60, cz, w * 1.20, h * 0.08, w * 1.05)
+        glColor3f(0.74, 0.73, 0.71)
+        _qbox(cx, bot + h * 0.68, cz, w * 1.08, h * 0.26, w * 0.95)
+        glColor3f(0.60, 0.59, 0.57)
+        _qbox(cx, bot + h * 0.94, cz, w * 1.30, h * 0.06, w * 1.15)
+
+def _stone_parapet(road, s, e, half):
+    half2 = half + 0.14
+    LIFT = 0.04
+    for ss in (-1., 1.):
+        glColor3f(0.58, 0.53, 0.45)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            ep = p + n * (ss * half2)
+            ry = float(p[1]) + LIFT
+            glNormal3f(float(ss * n[0]), 0., float(ss * n[2]))
+            glVertex3f(float(ep[0]), ry, float(ep[2]))
+            glVertex3f(float(ep[0]), ry + 0.72, float(ep[2]))
+        glEnd()
+        glColor3f(0.50, 0.46, 0.38)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            ry = float(p[1]) + LIFT
+            inner = p + n * (ss * (half + 0.04))
+            outer = p + n * (ss * (half2 + 0.14))
+            glNormal3f(0., 1., 0.)
+            glVertex3f(float(inner[0]), ry + 0.72, float(inner[2]))
+            glVertex3f(float(outer[0]), ry + 0.72, float(outer[2]))
+        glEnd()
+        glColor3f(0.56, 0.51, 0.43)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            op = p + n * (ss * (half2 + 0.14))
+            ry = float(p[1]) + LIFT
+            glNormal3f(float(ss * n[0]), 0., float(ss * n[2]))
+            glVertex3f(float(op[0]), ry, float(op[2]))
+            glVertex3f(float(op[0]), ry + 0.72, float(op[2]))
+        glEnd()
+
+def _concrete_parapet(road, s, e, half):
+    half2 = half + 0.18
+    LIFT = 0.04
+    for ss in (-1., 1.):
+        glColor3f(0.76, 0.75, 0.73)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            ep = p + n * (ss * half2)
+            ry = float(p[1]) + LIFT
+            glNormal3f(float(ss * n[0]), 0., float(ss * n[2]))
+            glVertex3f(float(ep[0]), ry, float(ep[2]))
+            glVertex3f(float(ep[0]), ry + 0.80, float(ep[2]))
+        glEnd()
+        glColor3f(0.68, 0.67, 0.65)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            ry = float(p[1]) + LIFT
+            inner = p + n * (ss * (half + 0.06))
+            outer = p + n * (ss * (half2 + 0.12))
+            glNormal3f(0., 1., 0.)
+            glVertex3f(float(inner[0]), ry + 0.80, float(inner[2]))
+            glVertex3f(float(outer[0]), ry + 0.80, float(outer[2]))
+        glEnd()
+        glColor3f(0.72, 0.71, 0.69)
+        glBegin(GL_QUAD_STRIP)
+        for i in range(s, e + 1):
+            p, _, n = road.get(i)
+            op = p + n * (ss * (half2 + 0.12))
+            ry = float(p[1]) + LIFT
+            glNormal3f(float(ss * n[0]), 0., float(ss * n[2]))
+            glVertex3f(float(op[0]), ry, float(op[2]))
+            glVertex3f(float(op[0]), ry + 0.80, float(op[2]))
+        glEnd()
+
+def draw_bridges(road, ci):
+    s = max(0, ci - DRAW_BH)
+    e = ci + DRAW_AH
+    half = ROAD_W * .5
+    glEnable(GL_LIGHTING)
+    glEnable(GL_POLYGON_OFFSET_FILL)
+    glPolygonOffset(2., 2.)
+    PILLAR_STEP = 6
+    i = s
+    while i <= e:
+        if not road.bridge(i):
+            i += 1
+            continue
+        span_s = i
+        while i <= e and road.bridge(i):
+            i += 1
+        span_e = i - 1
+        if span_e <= span_s:
+            continue
+        btype = _bridge_type(road, span_s)
+        anchor = span_s - (span_s % PILLAR_STEP)
+        for j in range(anchor, span_e + 1, PILLAR_STEP):
+            if j < span_s:
+                continue
+            p, _, _ = road.get(j)
+            px2, pz2 = float(p[0]), float(p[2])
+            g = th_c(px2, pz2)
+            bot = min(g, WATER_Y - 1.2)
+            h = max(0.8, float(p[1]) - bot - 0.14)
+            _arch_curve(px2, bot, pz2, 1.5, h, btype)
+        if btype == 0:
+            _stone_parapet(road, span_s, span_e, half)
+        else:
+            _concrete_parapet(road, span_s, span_e, half)
+    glDisable(GL_POLYGON_OFFSET_FILL)
+
+# ═══════════════════════════════════════════════════════
+#  TREES
+# ═══════════════════════════════════════════════════════
+TCELL = 16.
+TREE_R = 140.
+
+def _thash(ci, cj):
+    return int((ci * 73856093) ^ (cj * 19349663)) & 0x7FFFFFFF
+
+def _cyl(x, y, z, r, h, s=5):
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s + 1):
+        a = 2 * math.pi * j / s
+        ca = math.cos(a)
+        sa = math.sin(a)
+        glNormal3f(ca, 0, sa)
+        glVertex3f(x + r * ca, y, z + r * sa)
+        glVertex3f(x + r * ca, y + h, z + r * sa)
+    glEnd()
+
+def _cone(x, y, z, r, h, s=7):
+    inv = 1. / math.sqrt(h * h + r * r)
+    un = h * inv
+    glBegin(GL_TRIANGLE_FAN)
+    glNormal3f(0, 1, 0)
+    glVertex3f(x, y + h, z)
+    for j in range(s + 1):
+        a = 2 * math.pi * j / s
+        ca = math.cos(a)
+        sa = math.sin(a)
+        glNormal3f(ca * un, r * inv, sa * un)
+        glVertex3f(x + r * ca, y, z + r * sa)
+    glEnd()
+
+def _dome(x, y, z, r, h):
+    s = 8
+    glBegin(GL_TRIANGLE_FAN)
+    glNormal3f(0, 1, 0)
+    glVertex3f(x, y + h, z)
+    for j in range(s + 1):
+        a = 2 * math.pi * j / s
+        glNormal3f(math.cos(a), 0.4, math.sin(a))
+        glVertex3f(x + r * .85 * math.cos(a), y + h * .3, z + r * .85 * math.sin(a))
+    glEnd()
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s + 1):
+        a = 2 * math.pi * j / s
+        ca = math.cos(a)
+        sa = math.sin(a)
+        glNormal3f(ca, 0, sa)
+        glVertex3f(x + r * .85 * ca, y + h * .3, z + r * .85 * sa)
+        glVertex3f(x + r * ca, y, z + r * sa)
+    glEnd()
+
+TREE_ROAD_MARGIN = ROAD_W * 3.5
+FOREST_CELL = 750.0
+FOREST_PROB = 0.42
+
+def _fhash(ci, cj):
+    return int((ci * 92837111) ^ (cj * 689287499)) & 0x7FFFFFFF
+
+def _forest_influence(tx, tz):
+    fc_i = int(math.floor(tx / FOREST_CELL))
+    fc_j = int(math.floor(tz / FOREST_CELL))
+    best = 0.0
+    for di in range(-1, 2):
+        for dj in range(-1, 2):
+            ci = fc_i + di
+            cj = fc_j + dj
+            rng = random.Random(_fhash(ci, cj))
+            if rng.random() > FOREST_PROB:
+                continue
+            fx = ci * FOREST_CELL + rng.uniform(80, FOREST_CELL - 80)
+            fz = cj * FOREST_CELL + rng.uniform(80, FOREST_CELL - 80)
+            fr = rng.uniform(70, 130)
+            d = math.sqrt((tx - fx) ** 2 + (tz - fz) ** 2)
+            if d < fr:
+                t = 1.0 - d / fr
+                best = max(best, t * t * (3 - 2 * t))
+    return best
+
+_FIC = {}
+
+def _fi_cached(ci, cj):
+    k = (ci, cj)
+    v = _FIC.get(k)
+    if v is None:
+        if len(_FIC) > 12000:
+            _FIC.clear()
+        tx = (ci + 0.5) * TCELL
+        tz = (cj + 0.5) * TCELL
+        _FIC[k] = v = _forest_influence(tx, tz)
+    return v
+
+def draw_trees(player_pos, road, near_seg):
+    px, pz = float(player_pos[0]), float(player_pos[2])
+    R2 = TREE_R * TREE_R
+    i0 = int(math.floor((px - TREE_R) / TCELL))
+    i1 = int(math.floor((px + TREE_R) / TCELL)) + 1
+    j0 = int(math.floor((pz - TREE_R) / TCELL))
+    j1 = int(math.floor((pz + TREE_R) / TCELL)) + 1
+    lo = max(0, near_seg - 50)
+    hi = near_seg + 50
+    road.get(hi + 5)
+    road_pts = [(float(road.get(i)[0][0]), float(road.get(i)[0][2])) for i in range(lo, hi)]
+    M2 = TREE_ROAD_MARGIN ** 2
+    for ci in range(i0, i1):
+        for cj in range(j0, j1):
+            rng = random.Random(_thash(ci, cj))
+            tx = ci * TCELL + rng.uniform(1., TCELL - 1.)
+            tz = cj * TCELL + rng.uniform(1., TCELL - 1.)
+            if (tx - px) ** 2 + (tz - pz) ** 2 > R2:
+                continue
+            if _mac(tx, tz) < -0.20:
+                continue
+            gnd = th_c(tx, tz)
+            if gnd < WATER_Y + 0.5:
+                continue
+            if gnd > 200.0:
+                if rng.random() > max(0.0, 1.0 - (gnd - 200.0) / 300.0):
+                    continue
+            fi = _fi_cached(ci, cj)
+            if rng.random() > 0.38 + fi * 0.54:
+                continue
+            if any((tx - rpx) ** 2 + (tz - rpz) ** 2 < M2 for rpx, rpz in road_pts):
+                continue
+            scale = 1.0 + fi * 0.55
+            tkh = rng.uniform(1.4, 2.6) * scale
+            crr = rng.uniform(1.2, 2.0) * scale
+            crh = rng.uniform(2.5, 4.2) * scale
+            conifer = (rng.random() < (0.38 + fi * 0.30))
+            glColor3f(0.36 + rng.random() * .08, 0.22 + rng.random() * .06, 0.10 + rng.random() * .04)
+            _cyl(tx, gnd, tz, 0.20 * scale, tkh)
+            if conifer:
+                glColor3f(0.10 + rng.random() * .06, 0.28 + rng.random() * .10, 0.10 + rng.random() * .04)
+                _cone(tx, gnd + tkh, tz, crr * .70, crh * 1.30)
+            else:
+                glColor3f(0.20 + rng.random() * .10, 0.30 + rng.random() * .10, 0.10 + rng.random() * .06)
+                _dome(tx, gnd + tkh, tz, crr, crh * .80)
+
+# ═══════════════════════════════════════════════════════
+#  VEHICLES (simplified - full models in v1.2.1)
+# ═══════════════════════════════════════════════════════
+def _box(cx, cy, cz, w, h, d):
+    hw, hh, hd = w * .5, h * .5, d * .5
+    fs = ((0, 0, 1, (-hw, -hh, hd), (hw, -hh, hd), (hw, hh, hd), (-hw, hh, hd)),
+          (0, 0, -1, (hw, -hh, -hd), (-hw, -hh, -hd), (-hw, hh, -hd), (hw, hh, -hd)),
+          (1, 0, 0, (hw, -hh, -hd), (hw, -hh, hd), (hw, hh, hd), (hw, hh, -hd)),
+          (-1, 0, 0, (-hw, -hh, hd), (-hw, -hh, -hd), (-hw, hh, -hd), (-hw, hh, hd)),
+          (0, 1, 0, (-hw, hh, hd), (hw, hh, hd), (hw, hh, -hd), (-hw, hh, -hd)),
+          (0, -1, 0, (-hw, -hh, -hd), (hw, -hh, -hd), (hw, -hh, hd), (-hw, -hh, hd)))
+    glBegin(GL_QUADS)
+    for nx, ny, nz, v0, v1, v2, v3 in fs:
+        glNormal3f(nx, ny, nz)
+        for vx, vy, vz in (v0, v1, v2, v3):
+            glVertex3f(cx + vx, cy + vy, cz + vz)
+    glEnd()
+
+def _whl(cx, cy, cz, r, w, s=14):
+    hw = w * .5
+    TP = 2 * math.pi
+    glBegin(GL_QUAD_STRIP)
+    for j in range(s + 1):
+        a = TP * j / s
+        ca = math.cos(a)
+        sa = math.sin(a)
+        glNormal3f(0, ca, sa)
+        glVertex3f(cx - hw, cy + r * ca, cz + r * sa)
+        glVertex3f(cx + hw, cy + r * ca, cz + r * sa)
+    glEnd()
+    for sx, wd in ((-1, 1), (1, -1)):
+        glBegin(GL_TRIANGLE_FAN)
+        glNormal3f(float(sx), 0, 0)
+        glVertex3f(cx + sx * hw, cy, cz)
+        for j in range(s + 1):
+            a = wd * TP * j / s
+            glVertex3f(cx + sx * hw, cy + r * math.cos(a), cz + r * math.sin(a))
+        glEnd()
+
+def _vm(pp, fw, rg):
+    up = np.cross(rg, fw)
+    ul = np.linalg.norm(up)
+    if ul > 1e-6:
+        up /= ul
+    m = (float(rg[0]), float(rg[1]), float(rg[2]), 0,
+         float(up[0]), float(up[1]), float(up[2]), 0,
+         float(fw[0]), float(fw[1]), float(fw[2]), 0,
+         float(pp[0]), float(pp[1]), float(pp[2]), 1)
+    glPushMatrix()
+    glMultMatrixf(m)
+
+# Vehicle draw functions (simplified for v2.0)
+def draw_focus(pp, fw, rg, _=0.):
+    _vm(pp, fw, rg)
+    glColor3f(0.16, 0.16, 0.18)
+    _box(0, 0.10, 0, 1.80, 0.16, 4.20)
+    glColor3f(0.72, 0.74, 0.76)
+    _box(0, 0.54, 0.10, 1.90, 0.76, 4.28)
+    glColor3f(0.11, 0.11, 0.12)
+    for wz, wx in ((0.97, 1.01), (0.97, -1.01), (-1.68, 1.01), (-1.68, -1.01)):
+        _whl(wx, 0.31, wz, 0.31, 0.20)
+    glPopMatrix()
+
+def draw_civic(pp, fw, rg, _=0.):
+    _vm(pp, fw, rg)
+    glColor3f(0.80, 0.06, 0.08)
+    _box(0, 0.52, 0.10, 1.94, 0.74, 4.40)
+    glColor3f(0.11, 0.11, 0.12)
+    for wz, wx in ((1.02, 1.02), (1.02, -1.02), (-1.68, 1.02), (-1.68, -1.02)):
+        _whl(wx, 0.32, wz, 0.32, 0.22)
+    glPopMatrix()
+
+def draw_gemini2(pp, fw, rg, _=0.):
+    _vm(pp, fw, rg)
+    glColor3f(0.84, 0.05, 0.06)
+    _box(0, 1.50, 0, 2.46, 2.80, 11.20)
+    glColor3f(0.12, 0.12, 0.13)
+    for wx in (1.28, -1.28):
+        _whl(wx, 0.52, 3.10, 0.52, 0.28)
+    for ax in (-2.80, -4.00):
+        for wx in (1.36, -1.36):
+            _whl(wx, 0.52, ax, 0.52, 0.28)
+    glPopMatrix()
+
+def draw_levante(pp, fw, rg, _=0.):
+    _vm(pp, fw, rg)
+    glColor3f(0.92, 0.92, 0.94)
+    _box(0, 1.80, 0, 2.46, 2.72, 12.00)
+    glColor3f(0.12, 0.12, 0.13)
+    for wx in (1.28, -1.28):
+        _whl(wx, 0.54, 4.10, 0.54, 0.30)
+    for ax in (-1.30, -2.50):
+        for wx in (1.36, -1.36):
+            _whl(wx, 0.54, ax, 0.54, 0.30)
+    glPopMatrix()
+
+def draw_daf(pp, fw, rg, _=0.):
+    _vm(pp, fw, rg)
+    glColor3f(0.14, 0.26, 0.56)
+    _box(0, 2.04, 3.20, 2.46, 3.72, 3.80)
+    glColor3f(0.92, 0.92, 0.94)
+    _box(0, 2.30, -4.80, 2.46, 3.22, 9.20)
+    glColor3f(0.11, 0.11, 0.12)
+    for wx in (1.28, -1.28):
+        _whl(wx, 0.54, 4.20, 0.54, 0.32)
+    for wz in (-1.60, -2.70, -7.00, -8.00):
+        for wx in (1.36, -1.36):
+            _whl(wx, 0.54, wz, 0.54, 0.32)
+    glPopMatrix()
+
+def draw_honda_cb(pp, fw, rg, lean=0.):
+    lr = math.radians(lean)
+    cl, sl = math.cos(lr), math.sin(lr)
+    world_up = np.array([0., 1., 0.])
+    up_v = world_up * cl - rg * sl
+    ul = np.linalg.norm(up_v)
+    if ul > 1e-6:
+        up_v /= ul
+    rg2 = np.cross(fw, up_v)
+    rl = np.linalg.norm(rg2)
+    if rl > 1e-6:
+        rg2 /= rl
+    up = np.cross(rg2, fw)
+    ul = np.linalg.norm(up)
+    if ul > 1e-6:
+        up /= ul
+    m = (float(rg2[0]), float(rg2[1]), float(rg2[2]), 0,
+         float(up[0]), float(up[1]), float(up[2]), 0,
+         float(fw[0]), float(fw[1]), float(fw[2]), 0,
+         float(pp[0]), float(pp[1]), float(pp[2]), 1)
+    glPushMatrix()
+    glMultMatrixf(m)
+    glColor3f(0.68, 0.70, 0.72)
+    _box(0, .98, .24, .28, .30, .72)
+    glColor3f(0.11, 0.11, 0.12)
+    _whl(0, 0.30, .88, 0.30, 0.14)
+    _whl(0, 0.30, -.82, 0.30, 0.14)
+    glPopMatrix()
+
+_FRONT_CAM = False
+
+def draw_vehicle(player):
+    if _FRONT_CAM:
+        return
+    f = player.sfwd()
+    r = player.srgt()
+    p = player.pos
+    v = player.veh
+    if v == 'focus':
+        draw_focus(p, f, r)
+    elif v == 'civic':
+        draw_civic(p, f, r)
+    elif v == 'gemini2':
+        draw_gemini2(p, f, r)
+    elif v == 'levante':
+        draw_levante(p, f, r)
+    elif v == 'daf':
+        draw_daf(p, f, r)
+    elif v == 'honda_cb':
+        draw_honda_cb(p, f, r, player.lean())
+
+# ═══════════════════════════════════════════════════════
+#  HUD
+# ═══════════════════════════════════════════════════════
+_SPD_MAX = {'focus': 120, 'civic': 150, 'gemini2': 60, 'levante': 70, 'daf': 60, 'honda_cb': 130}
+_SPD_COLS = [(0, 50, '#1db84a'), (50, 80, '#e6c014'), (80, 200, '#e03030')]
+_VCOLS = {'focus': (0.70, 0.72, 0.74), 'civic': (0.76, 0.08, 0.10),
+          'gemini2': (0.82, 0.06, 0.07), 'levante': (0.92, 0.92, 0.94),
+          'daf': (0.14, 0.26, 0.54), 'honda_cb': (0.66, 0.68, 0.70)}
+
+def _hex(s):
+    r = int(s[1:3], 16) / 255
+    g = int(s[3:5], 16) / 255
+    b = int(s[5:7], 16) / 255
+    return r, g, b
+
+def _ring_arc(cx, cy, r, a0, a1, thick, segs=48):
+    glBegin(GL_QUAD_STRIP)
+    for i in range(segs + 1):
+        a = a0 + (a1 - a0) * i / segs
+        ca, sa = math.cos(a), math.sin(a)
+        glVertex2f(cx + (r - thick) * ca, cy + (r - thick) * sa)
+        glVertex2f(cx + r * ca, cy + r * sa)
+    glEnd()
+
+def _filled_circle(cx, cy, r, segs=32):
+    glBegin(GL_TRIANGLE_FAN)
+    glVertex2f(cx, cy)
+    for i in range(segs + 1):
+        a = 2 * math.pi * i / segs
+        glVertex2f(cx + r * math.cos(a), cy + r * math.sin(a))
+    glEnd()
+
+_TXT_CACHE = {}
+
+def _draw_text_hud(text, cx, cy, size=38, color=(230, 240, 200, 255)):
+    key = (text, size, color)
+    if key not in _TXT_CACHE:
+        if len(_TXT_CACHE) > 400:
+            for tex, _, _ in _TXT_CACHE.values():
+                glDeleteTextures([tex])
+            _TXT_CACHE.clear()
+        font = pygame.font.SysFont('consolas,courier new,monospace', size, bold=True)
+        surf = font.render(text, True, color[:3])
+        surf = surf.convert_alpha()
+        tw, th = surf.get_size()
+        raw = pygame.image.tostring(surf, 'RGBA', True)
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tw, th, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        _TXT_CACHE[key] = (tex, tw, th)
+    tex, tw, th = _TXT_CACHE[key]
+    x, y = cx - tw / 2., cy - th / 2.
+    glEnable(GL_TEXTURE_2D)
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glColor4f(1, 1, 1, 1)
+    glBegin(GL_QUADS)
+    glTexCoord2f(0, 0)
+    glVertex2f(x, y)
+    glTexCoord2f(1, 0)
+    glVertex2f(x + tw, y)
+    glTexCoord2f(1, 1)
+    glVertex2f(x + tw, y + th)
+    glTexCoord2f(0, 1)
+    glVertex2f(x, y + th)
+    glEnd()
+    glDisable(GL_TEXTURE_2D)
+    return tw, th
+
+def draw_speedometer(player, show_hud=True):
+    if not show_hud:
+        return
+    spd_mph = abs(player.speed) * 2.23694
+    max_s = float(_SPD_MAX.get(player.veh, 140))
+    frac = min(1.0, spd_mph / max_s)
+    cx = WIN_W - 118.
+    cy = 118.
+    R = 78.
+    thick = 13.
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_FOG)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, WIN_W, 0, WIN_H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glColor4f(0.24, 0.26, 0.30, 1.0)
+    _filled_circle(cx, cy, R + thick + 8)
+    glColor4f(0.06, 0.06, 0.10, 1.0)
+    _filled_circle(cx, cy, R + thick + 4)
+    A0 = math.radians(225.)
+    SWEEP = math.radians(-270.)
+    glColor4f(0.20, 0.20, 0.22, 1.0)
+    _ring_arc(cx, cy, R + thick, A0, A0 + SWEEP, thick)
+    for lo, hi, col in _SPD_COLS:
+        f_lo = lo / max_s
+        f_hi = min(hi, max_s) / max_s
+        if frac <= f_lo:
+            break
+        ta = A0 + f_lo * SWEEP
+        tb = A0 + min(frac, f_hi) * SWEEP
+        glColor3f(*_hex(col))
+        _ring_arc(cx, cy, R + thick, ta, tb, thick)
+    step = 10
+    for v in range(0, int(max_s) + 1, step):
+        ang = A0 + (v / max_s) * SWEEP
+        ca, sa = math.cos(ang), math.sin(ang)
+        maj = (v % (step * 4) == 0)
+        inner = R - 6 if maj else R
+        glColor3f(0.88, 0.88, 0.88) if maj else glColor3f(0.38, 0.38, 0.42)
+        glLineWidth(2.5 if maj else 1.2)
+        glBegin(GL_LINES)
+        glVertex2f(cx + inner * ca, cy + inner * sa)
+        glVertex2f(cx + (R + thick) * ca, cy + (R + thick) * sa)
+        glEnd()
+    glLineWidth(1.)
+    nang = A0 + frac * SWEEP
+    nca, nsa = math.cos(nang), math.sin(nang)
+    glColor4f(0, 0, 0, 0.55)
+    glLineWidth(6.)
+    glBegin(GL_LINES)
+    glVertex2f(cx - nca * 16 + 1, cy - nsa * 16 - 1)
+    glVertex2f(cx + nca * (R - 5) + 1, cy + nsa * (R - 5) - 1)
+    glEnd()
+    glColor3f(1.0, 0.28, 0.08)
+    glLineWidth(3.)
+    glBegin(GL_LINES)
+    glVertex2f(cx - nca * 16, cy - nsa * 16)
+    glVertex2f(cx + nca * (R - 5), cy + nsa * (R - 5))
+    glEnd()
+    glLineWidth(1.)
+    glColor3f(0.14, 0.14, 0.18)
+    _filled_circle(cx, cy, 12)
+    glColor3f(1.0, 0.28, 0.08)
+    _filled_circle(cx, cy, 6)
+    lbl = str(int(spd_mph))
+    pad = 10.
+    dw, dh = len(lbl) * 26. + pad * 2, 52.
+    px0 = cx - dw / 2.
+    py0 = cy - 38.
+    glColor4f(0.06, 0.06, 0.10, 0.92)
+    glBegin(GL_QUADS)
+    glVertex2f(px0, py0)
+    glVertex2f(px0 + dw, py0)
+    glVertex2f(px0 + dw, py0 + dh)
+    glVertex2f(px0, py0 + dh)
+    glEnd()
+    _draw_text_hud(lbl, cx, py0 + dh * 0.54, size=42, color=(240, 255, 180, 255))
+    _draw_text_hud('mph', cx, py0 - 10., size=18, color=(160, 168, 180, 255))
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_FOG)
+
+def draw_boundary_flash(intensity):
+    if intensity <= 0.:
+        return
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_FOG)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, WIN_W, 0, WIN_H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    a = intensity * 0.55
+    bw = 80
+    glColor4f(0.8, 0.1, 0.05, a)
+    for (x0, y0, x1, y1) in [(0, 0, WIN_W, bw), (0, WIN_H - bw, WIN_W, WIN_H),
+                             (0, 0, bw, WIN_H), (WIN_W - bw, 0, WIN_W, WIN_H)]:
+        glBegin(GL_QUADS)
+        glVertex2f(x0, y0)
+        glVertex2f(x1, y0)
+        glVertex2f(x1, y1)
+        glVertex2f(x0, y1)
+        glEnd()
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_FOG)
+
+def draw_hud(current, show_hud=True):
+    if not show_hud:
+        return
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_FOG)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, WIN_W, 0, WIN_H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    tw, gap, bh, sh = 72, 8, 20, 32
+    total = (6 * tw + 5 * gap)
+    x0 = (WIN_W - total) // 2
+    for idx, vn in enumerate(VNAMES):
+        x = x0 + idx * (tw + gap)
+        sel = (vn == current)
+        h = sh if sel else bh
+        r, g, b = _VCOLS[vn]
+        glColor4f(r * .25, g * .25, b * .25, 0.78)
+        glBegin(GL_QUADS)
+        glVertex2f(x, 0)
+        glVertex2f(x + tw, 0)
+        glVertex2f(x + tw, h)
+        glVertex2f(x, h)
+        glEnd()
+        stripe = 7 if sel else 3
+        glColor4f(r, g, b, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(x, h - stripe)
+        glVertex2f(x + tw, h - stripe)
+        glVertex2f(x + tw, h)
+        glVertex2f(x, h)
+        glEnd()
+        glColor4f(0.85, 0.85, 0.85, 0.9)
+        kx = x + 5
+        ky = h - stripe - 11
+        glBegin(GL_QUADS)
+        glVertex2f(kx, ky)
+        glVertex2f(kx + 9, ky)
+        glVertex2f(kx + 9, ky + 8)
+        glVertex2f(kx, ky + 8)
+        glEnd()
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_FOG)
+
+def draw_minimap(player, road, show=True):
+    """NEW in v2.0: Minimap showing road ahead and player position."""
+    if not show:
+        return
+    map_size = 140
+    map_scale = 3.0
+    cx, cy = map_size + 10, WIN_H - 10
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_FOG)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, WIN_W, 0, WIN_H, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    # Background
+    glColor4f(0.05, 0.05, 0.08, 0.85)
+    glBegin(GL_QUADS)
+    glVertex2f(cx - map_size / 2, cy - map_size / 2)
+    glVertex2f(cx + map_size / 2, cy - map_size / 2)
+    glVertex2f(cx + map_size / 2, cy + map_size / 2)
+    glVertex2f(cx - map_size / 2, cy + map_size / 2)
+    glEnd()
+    # Draw road segments
+    px, pz = float(player.pos[0]), float(player.pos[2])
+    heading = player.heading
+    glBegin(GL_LINE_STRIP)
+    glColor3f(0.6, 0.6, 0.6)
+    for i in range(max(0, player.near - 20), player.near + 30):
+        p = road.get(i)[0]
+        dx = (float(p[0]) - px) * math.cos(heading) - (float(p[2]) - pz) * math.sin(heading)
+        dy = (float(p[0]) - px) * math.sin(heading) + (float(p[2]) - pz) * math.cos(heading)
+        mx = cx + dx * map_scale
+        my = cy - dy * map_scale
+        if i == player.near:
+            glEnd()
+            glColor3f(0.9, 0.7, 0.3)
+            glBegin(GL_LINE_STRIP)
+            glVertex2f(mx, my)
+        else:
+            glVertex2f(mx, my)
+    glEnd()
+    # Player arrow
+    glColor3f(0.2, 0.9, 0.3)
+    glBegin(GL_TRIANGLES)
+    glVertex2f(cx, cy + 8)
+    glVertex2f(cx - 6, cy - 4)
+    glVertex2f(cx + 6, cy - 4)
+    glEnd()
+    glDisable(GL_BLEND)
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_FOG)
+
+# ═══════════════════════════════════════════════════════
+#  OPENGL SETUP
+# ═══════════════════════════════════════════════════════
+def setup_gl(w, h):
+    global WIN_W, WIN_H
+    WIN_W, WIN_H = w, h
+    glClearColor(*SKY_BOT, 1.)
+    glEnable(GL_DEPTH_TEST)
+    glDepthFunc(GL_LEQUAL)
+    glEnable(GL_LIGHTING)
+    glEnable(GL_LIGHT0)
+    glEnable(GL_COLOR_MATERIAL)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    glLightfv(GL_LIGHT0, GL_POSITION, [0.5, 1., 0.4, 0.])
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.88, 0.88, 0.82, 1.])
+    glLightfv(GL_LIGHT0, GL_AMBIENT, [0.30, 0.30, 0.34, 1.])
+    glLightfv(GL_LIGHT0, GL_SPECULAR, [0., 0., 0., 1.])
+    glEnable(GL_FOG)
+    glFogi(GL_FOG_MODE, GL_EXP2)
+    glFogfv(GL_FOG_COLOR, FOG_COL)
+    glFogf(GL_FOG_DENSITY, 0.0072)
+    glFogf(GL_FOG_START, 80.)
+    glFogf(GL_FOG_END, 360.)
+    glHint(GL_FOG_HINT, GL_NICEST)
+    glViewport(0, 0, w, h)
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(FOV, w / h, NEAR, FAR)
+    glMatrixMode(GL_MODELVIEW)
+
+# ═══════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════
+def _quit():
+    pygame.quit()
+    sys.exit()
+
+def main():
+    global WIN_W, WIN_H
+    try:
+        pygame.init()
+        pygame.font.init()
+        info = pygame.display.Info()
+        native_w, native_h = info.current_w, info.current_h
+    except Exception as e:
+        print(f"Failed to initialize pygame: {e}", file=sys.stderr)
+        sys.exit(1)
+    fullscreen = True
+    flags = DOUBLEBUF | OPENGL | FULLSCREEN
+    try:
+        pygame.display.set_mode((native_w, native_h), flags)
+        pygame.display.set_caption("Pyroads 2.0 · F11=window · ESC=quit")
+    except Exception as e:
+        print(f"Failed to create display: {e}", file=sys.stderr)
+        pygame.quit()
+        sys.exit(1)
+    clock = pygame.time.Clock()
+    try:
+        setup_gl(native_w, native_h)
+    except Exception as e:
+        print(f"Failed to initialize OpenGL: {e}", file=sys.stderr)
+        pygame.quit()
+        sys.exit(1)
+    road = Road()
+    player = Player(road, 'focus')
+    cam = Camera()
+    cam.setveh('focus')
+    p0, t0, _ = road.get(5)
+    back0 = np.array([-t0[0], 0., -t0[2]])
+    back0 /= np.linalg.norm(back0) + 1e-9
+    cam._eye = p0 + back0 * cam._cb + np.array([0., cam._cu, 0.])
+    cam._at = p0 + t0 * 5.
+    rclick = False
+    frame = 0
+    paused = False
+    show_hud = True
+    show_minimap = True
+    while True:
+        dt = min(clock.tick(60) / 1000., 0.05)
+        frame += 1
+        fps = clock.get_fps()
+        for ev in pygame.event.get():
+            if ev.type == QUIT:
+                _quit()
+            if ev.type == KEYDOWN:
+                if ev.key == K_ESCAPE:
+                    _quit()
+                if ev.key == K_F11:
+                    fullscreen = not fullscreen
+                    try:
+                        if fullscreen:
+                            pygame.display.set_mode((native_w, native_h), DOUBLEBUF | OPENGL | FULLSCREEN)
+                            setup_gl(native_w, native_h)
+                        else:
+                            ww, wh = min(native_w, 1280), min(native_h, 720)
+                            pygame.display.set_mode((ww, wh), DOUBLEBUF | OPENGL | RESIZABLE)
+                            setup_gl(ww, wh)
+                    except Exception as e:
+                        print(f"Display mode change failed: {e}", file=sys.stderr)
+                vm = {K_1: 'focus', K_2: 'civic', K_3: 'gemini2', K_4: 'levante', K_5: 'daf', K_6: 'honda_cb'}
+                if ev.key in vm:
+                    nv = vm[ev.key]
+                    if nv != player.veh:
+                        player.veh = nv
+                        cam.setveh(nv)
+                if ev.key == K_c:
+                    cam.mode = 1 - cam.mode
+                    cam._tilt = 0.
+                    if cam.mode == 0:
+                        cam.oyaw = 0.
+                        cam.opitch = 0.
+                if ev.key == K_p:
+                    paused = not paused
+                if ev.key == K_h:
+                    show_hud = not show_hud
+                if ev.key == K_m:
+                    show_minimap = not show_minimap
+            if ev.type == VIDEORESIZE:
+                try:
+                    setup_gl(ev.w, ev.h)
+                except Exception:
+                    pass
+            if ev.type == MOUSEBUTTONDOWN and ev.button == 3:
+                rclick = True
+                pygame.mouse.get_rel()
+            if ev.type == MOUSEBUTTONUP and ev.button == 3:
+                rclick = False
+            if ev.type == MOUSEMOTION and rclick:
+                rx, ry = ev.rel
+                cam.oyaw -= rx * 0.35
+                cam.opitch = max(-28., min(52., cam.opitch + ry * 0.28))
+            if ev.type == MOUSEWHEEL:
+                cam.zoom = max(0.35, min(4.0, cam.zoom - ev.y * 0.12))
+            elif ev.type == MOUSEBUTTONDOWN:
+                if ev.button == 4:
+                    cam.zoom = max(0.35, cam.zoom - 0.12)
+                elif ev.button == 5:
+                    cam.zoom = min(4.0, cam.zoom + 0.12)
+        if not rclick:
+            decay = 1. - min(1., 3.5 * dt)
+            cam.oyaw *= decay
+            cam.opitch *= decay
+        keys = pygame.key.get_pressed()
+        if not paused:
+            player.update(road, keys, dt)
+            cam.update(player, dt)
+        if frame % 30 == 0:
+            mph = abs(player.speed) * 2.23694
+            mode = "FS" if fullscreen else "Win"
+            cam_label = "FrontCam" if cam.mode == 1 else "Follow"
+            pause_str = " ||PAUSED|| " if paused else ""
+            pygame.display.set_caption(
+                f"Pyroads 2.0 · {player.veh} · "
+                f"{mph:.0f} mph · {fps:.0f} FPS{pause_str} · 1-6=veh C=cam({cam_label}) M=minimap H=HUD F11={mode} ESC=quit")
+        try:
+            glClear(GL_COLOR_BUFFER_BIT)
+            draw_sky()
+            glClear(GL_DEPTH_BUFFER_BIT)
+            cam.apply()
+            glLightfv(GL_LIGHT0, GL_POSITION, [0.5, 1., 0.4, 0.])
+            ci = player.near
+            global _FRONT_CAM
+            _FRONT_CAM = (cam.mode == 1)
+            draw_sea(player.pos)
+            draw_terrain(road, ci)
+            draw_road(road, ci)
+            draw_bridges(road, ci)
+            draw_vehicle(player)
+            draw_trees(player.pos, road, player.near)
+            draw_boundary_flash(player.at_boundary)
+            draw_speedometer(player, show_hud)
+            draw_hud(player.veh, show_hud)
+            draw_minimap(player, road, show_minimap)
+            pygame.display.flip()
+        except Exception as e:
+            print(f"Render error: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

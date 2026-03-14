@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pyroads.py  –  Infinite UK countryside drive · PyOpenGL
+Pyroads.py – Infinite UK countryside drive · PyOpenGL
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 pip install pygame PyOpenGL PyOpenGL_accelerate numpy
 python Pyroads.py
@@ -10,6 +10,8 @@ Controls
   A/Left     steer left        D/Right    steer right
   1  Sports Car   2  Coach   3  Truck   4  Motorbike
   RMB drag   orbit camera     ESC  quit
+  F11        toggle fullscreen
+  C          toggle camera view
 """
 import sys, math, random
 import numpy as np
@@ -174,7 +176,7 @@ def terrain_normal(x,z):
     hB=th_s(x,z-_NE); hF=th_s(x,z+_NE)
     tx=np.array([2.*_NE,hR-hL,0.]); tz=np.array([0.,hF-hB,2.*_NE])
     n=np.cross(tz,tx); nl=np.linalg.norm(n)
-    return n/nl if nl>1e-6 else np.array([0.,1.,0.])
+    return n/nl if nl>1e-8 else np.array([0.,1.,0.])
 
 # ═══════════════════════════════════════════════════════
 #  ROAD SPLINE
@@ -625,7 +627,6 @@ def draw_bridges(road,ci):
         else:        _concrete_parapet(road,span_s,span_e,half)
 
     glDisable(GL_POLYGON_OFFSET_FILL)
-    glEnable(GL_LIGHTING)
 
 # ═══════════════════════════════════════════════════════
 #  TREES  – denser, cached forest influence, low-poly
@@ -1392,18 +1393,37 @@ def setup_gl(w,h):
 # ═══════════════════════════════════════════════════════
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════
+def _quit():
+    """Clean shutdown helper."""
+    pygame.quit()
+    sys.exit()
+
 def main():
     global WIN_W, WIN_H
-    pygame.init()
-    pygame.font.init()
-    info = pygame.display.Info()
-    native_w, native_h = info.current_w, info.current_h
+    try:
+        pygame.init()
+        pygame.font.init()
+        info = pygame.display.Info()
+        native_w, native_h = info.current_w, info.current_h
+    except Exception as e:
+        print(f"Failed to initialize pygame: {e}", file=sys.stderr)
+        sys.exit(1)
     fullscreen = True
     flags = DOUBLEBUF|OPENGL|FULLSCREEN
-    pygame.display.set_mode((native_w, native_h), flags)
-    pygame.display.set_caption("Slow Roads UK  ·  F11=window  ·  ESC=quit")
+    try:
+        pygame.display.set_mode((native_w, native_h), flags)
+        pygame.display.set_caption("Slow Roads UK  ·  F11=window  ·  ESC=quit")
+    except Exception as e:
+        print(f"Failed to create display: {e}", file=sys.stderr)
+        pygame.quit()
+        sys.exit(1)
     clock = pygame.time.Clock()
-    setup_gl(native_w, native_h)
+    try:
+        setup_gl(native_w, native_h)
+    except Exception as e:
+        print(f"Failed to initialize OpenGL: {e}", file=sys.stderr)
+        pygame.quit()
+        sys.exit(1)
 
     road   = Road()
     player = Player(road,'focus')
@@ -1417,20 +1437,24 @@ def main():
 
     while True:
         dt=min(clock.tick(60)/1000.,0.05); frame+=1
+        fps=clock.get_fps()
 
         for ev in pygame.event.get():
-            if ev.type==QUIT: pygame.quit(); sys.exit()
+            if ev.type==QUIT: _quit()
             if ev.type==KEYDOWN:
-                if ev.key==K_ESCAPE: pygame.quit(); sys.exit()
+                if ev.key==K_ESCAPE: _quit()
                 if ev.key==K_F11:
                     fullscreen = not fullscreen
-                    if fullscreen:
-                        pygame.display.set_mode((native_w,native_h), DOUBLEBUF|OPENGL|FULLSCREEN)
-                        setup_gl(native_w, native_h)
-                    else:
-                        ww,wh = min(native_w,1280), min(native_h,720)
-                        pygame.display.set_mode((ww,wh), DOUBLEBUF|OPENGL|RESIZABLE)
-                        setup_gl(ww, wh)
+                    try:
+                        if fullscreen:
+                            pygame.display.set_mode((native_w,native_h), DOUBLEBUF|OPENGL|FULLSCREEN)
+                            setup_gl(native_w, native_h)
+                        else:
+                            ww,wh = min(native_w,1280), min(native_h,720)
+                            pygame.display.set_mode((ww,wh), DOUBLEBUF|OPENGL|RESIZABLE)
+                            setup_gl(ww, wh)
+                    except Exception as e:
+                        print(f"Display mode change failed: {e}", file=sys.stderr)
                 vm={K_1:'focus',K_2:'civic',K_3:'gemini2',K_4:'levante',K_5:'daf',K_6:'honda_cb'}
                 if ev.key in vm:
                     nv=vm[ev.key]
@@ -1440,7 +1464,10 @@ def main():
                     cam._tilt=0.
                     if cam.mode==0: cam.oyaw=0.; cam.opitch=0.
             if ev.type==VIDEORESIZE:
-                setup_gl(ev.w, ev.h)
+                try:
+                    setup_gl(ev.w, ev.h)
+                except Exception:
+                    pass
             if ev.type==MOUSEBUTTONDOWN and ev.button==3:
                 rclick=True; pygame.mouse.get_rel()
             if ev.type==MOUSEBUTTONUP and ev.button==3: rclick=False
@@ -1448,12 +1475,12 @@ def main():
                 rx,ry=ev.rel
                 cam.oyaw  -=rx*0.35
                 cam.opitch=max(-28.,min(52.,cam.opitch+ry*0.28))
-            # scrollwheel zoom (pygame 2: MOUSEWHEEL; pygame 1: buttons 4/5)
+            # scrollwheel zoom (pygame 2+: MOUSEWHEEL; pygame 1: buttons 4/5)
             if ev.type==MOUSEWHEEL:
                 cam.zoom=max(0.35,min(4.0,cam.zoom-ev.y*0.12))
-            if ev.type==MOUSEBUTTONDOWN:
+            elif ev.type==MOUSEBUTTONDOWN:
                 if ev.button==4: cam.zoom=max(0.35,cam.zoom-0.12)
-                if ev.button==5: cam.zoom=min(4.0, cam.zoom+0.12)
+                elif ev.button==5: cam.zoom=min(4.0, cam.zoom+0.12)
 
         if not rclick:
             decay=1.-min(1.,3.5*dt)
@@ -1469,28 +1496,31 @@ def main():
             cam_label="FrontCam" if cam.mode==1 else "Follow"
             pygame.display.set_caption(
                 f"Slow Roads UK  ·  {player.veh}  ·  "
-                f"{mph:.0f} mph  ·  1-6=veh  C=cam({cam_label})  F11={mode}  ESC=quit")
+                f"{mph:.0f} mph  ·  {fps:.0f} FPS  ·  1-6=veh  C=cam({cam_label})  F11={mode}  ESC=quit")
 
-        glClear(GL_COLOR_BUFFER_BIT)
-        draw_sky()
-        glClear(GL_DEPTH_BUFFER_BIT)
-        cam.apply()
-        glLightfv(GL_LIGHT0,GL_POSITION,[0.5,1.,0.4,0.])
+        try:
+            glClear(GL_COLOR_BUFFER_BIT)
+            draw_sky()
+            glClear(GL_DEPTH_BUFFER_BIT)
+            cam.apply()
+            glLightfv(GL_LIGHT0,GL_POSITION,[0.5,1.,0.4,0.])
 
-        ci=player.near
-        global _FRONT_CAM; _FRONT_CAM=(cam.mode==1)
-        draw_sea(player.pos)
-        draw_terrain(road,ci)
-        draw_road(road,ci)
-        draw_bridges(road,ci)
-        draw_vehicle(player)
-        draw_trees(player.pos, road, player.near)
+            ci=player.near
+            global _FRONT_CAM; _FRONT_CAM=(cam.mode==1)
+            draw_sea(player.pos)
+            draw_terrain(road,ci)
+            draw_road(road,ci)
+            draw_bridges(road,ci)
+            draw_vehicle(player)
+            draw_trees(player.pos, road, player.near)
 
-        draw_boundary_flash(player.at_boundary)
-        draw_speedometer(player)
-        draw_hud(player.veh)
+            draw_boundary_flash(player.at_boundary)
+            draw_speedometer(player)
+            draw_hud(player.veh)
 
-        pygame.display.flip()
+            pygame.display.flip()
+        except Exception as e:
+            print(f"Render error: {e}", file=sys.stderr)
 
 if __name__=="__main__":
     main()
