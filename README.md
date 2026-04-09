@@ -7,7 +7,7 @@ Whether you need a break from work, a moment to relax, or simply enjoy the feeli
 
 # Pyroads — Drive. Relax. Repeat.
 
-full version coming in 2028
+full version coming in never because I gave up 3d is hard💔
 
 <img width="1269" height="702" alt="image" src="https://github.com/user-attachments/assets/5eefd265-6cdb-4b2b-b151-d9c13fa3ddb2" />
 v1.2.1
